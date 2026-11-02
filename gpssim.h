@@ -9,11 +9,24 @@
 /*! \brief Maximum length of a line in a text file (RINEX, motion) */
 #define MAX_CHAR (100)
 
+/*! \brief Maximum length of a file name */
+#define MAX_PATH_LEN (1024)
+
+/*! \brief GNSS constellation identifiers */
+#define SYS_GPS (0)
+#define SYS_GAL (1)
+
 /*! \brief Maximum number of satellites in RINEX file */
 #define MAX_SAT (32)
 
+/*! \brief Maximum number of Galileo satellites (SVID 1..36) */
+#define MAX_SAT_GAL (36)
+
+/*! \brief Maximum number of Galileo ephemeris records per satellite */
+#define MAX_GAL_EPH (300)
+
 /*! \brief Maximum number of channels we simulate */
-#define MAX_CHAN (16)
+#define MAX_CHAN (32)
 
 /*! \brief Maximum number of user motion points */
 #ifndef USER_MOTION_SIZE
@@ -34,6 +47,27 @@
 
 /*! \brief C/A code sequence length */
 #define CA_SEQ_LEN (1023)
+
+/*! \brief Galileo E1-B/C primary code length */
+#define GAL_CODE_LEN (4092)
+
+/*! \brief Galileo E1-C secondary code length (CS25_1) */
+#define GAL_SEC_CODE_LEN (25)
+
+/*! \brief Galileo I/NAV page part: 120 bits, 250 symbols (sync + encoded) per second */
+#define GAL_PART_BITS (120)
+#define GAL_PART_SYMS (250)
+
+/*! \brief Galileo I/NAV page buffer: last page of the previous sub-frame + 15 pages */
+#define GAL_N_PAGE (16)
+#define GAL_SYM_BUF (GAL_N_PAGE*2*GAL_PART_SYMS)
+
+/*! \brief GST week number at the GPS week number 1024 epoch */
+#define GAL_WEEK_OFFSET (1024)
+
+/*! \brief Galileo E1 amplitude relative to GPS C/A: sqrt(10^(1.25/10)/2)
+ *  (E1-B + E1-C at -157.25 dBW vs. C/A at -158.5 dBW) */
+#define GAL_E1_AMP (0.8167)
 
 #define SECONDS_IN_WEEK 604800.0
 #define SECONDS_IN_HALF_WEEK 302400.0
@@ -56,6 +90,8 @@
 
 // Conventional values employed in GPS ephemeris model (ICD-GPS-200)
 #define GM_EARTH 3.986005e14
+// Galileo ephemeris model (Galileo OS SIS ICD)
+#define GM_EARTH_GAL 3.986004418e14
 #define OMEGA_EARTH 7.2921151467e-5
 #define PI 3.1415926535898
 
@@ -125,9 +161,11 @@ typedef struct
 	double af0;	/*!< Clock offset (seconds) */
 	double af1;	/*!< rate (sec/sec) */
 	double af2;	/*!< acceleration (sec/sec^2) */
-	double tgd;	/*!< Group delay L2 bias */
+	double tgd;	/*!< Group delay L2 bias (Galileo: BGD E1-E5b) */
 	int svhlth;
-	int codeL2;
+	int codeL2;	/*!< Codes on L2 (Galileo: data sources) */
+	double bgda;	/*!< Galileo: BGD E1-E5a (seconds) */
+	double sisa;	/*!< Galileo: signal in space accuracy (meters) */
 	// Working variables follow
 	double n; 	/*!< Mean motion (Average angular velocity) */
 	double sq1e2;	/*!< sqrt(1-e^2) */
@@ -146,7 +184,35 @@ typedef struct
 	int dtlsf,dn,wnlsf;
 	// enable custom leap event
 	int leapen;
+	// enable tropospheric delay
+	int tropo;
 } ionoutc_t;
+
+/*! \brief Galileo ionospheric, GST-UTC and GST-GPS parameters */
+typedef struct
+{
+	int vflg;
+	double ai0,ai1,ai2;	/*!< NeQuick effective ionisation level coefficients */
+	double A0,A1;		/*!< GST-UTC polynomial */
+	int tot,wnt;		/*!< GST-UTC reference time (wnt: GPS-aligned week) */
+	double A0G,A1G;		/*!< GST-GPS polynomial */
+	int t0g,wn0g;		/*!< GGTO reference time (wn0g: GPS-aligned week) */
+} galutc_t;
+
+/*! \brief Galileo almanac of a single satellite (derived from ephemeris) */
+typedef struct
+{
+	int svid;	/*!< 0 = unused entry */
+	double dsqrta;	/*!< sqrt(A) - sqrt(A_nominal) */
+	double ecc;
+	double aop;	/*!< radians */
+	double di;	/*!< i - i_nominal (radians) */
+	double omg0;	/*!< radians */
+	double omgdot;	/*!< radians/s */
+	double m0;	/*!< radians at t0a */
+	double af0,af1;
+	int hs;		/*!< E1-B/E5b health status */
+} galalm_t;
 
 typedef struct
 {
@@ -156,13 +222,17 @@ typedef struct
 	double d; // geometric distance
 	double azel[2];
 	double iono_delay;
+	double tropo_delay;
 } range_t;
 
 /*! \brief Structure representing a Channel */
 typedef struct
 {
-	int prn;	/*< PRN Number */
-	int ca[CA_SEQ_LEN]; /*< C/A Sequence */
+	int prn;	/*< PRN Number (0 = free channel) */
+	int sys;	/*< Constellation (SYS_GPS, SYS_GAL) */
+	int code_len;	/*< Primary code length in chips */
+	int ca[GAL_CODE_LEN]; /*< C/A sequence (0/1), or E1-B code (+1/-1) */
+	int pilot[GAL_CODE_LEN]; /*< E1-C code (+1/-1) */
 	double f_carr;	/*< Carrier frequency */
 	double f_code;	/*< Code frequency */
 #ifdef FLOAT_CARR_PHASE
@@ -180,6 +250,9 @@ typedef struct
 	int icode;	/*!< initial code */
 	int dataBit;	/*!< current data bit */
 	int codeCA;	/*!< current C/A code */
+	unsigned char sym[GAL_SYM_BUF]; /*!< Galileo I/NAV symbols (logic 0/1) */
+	int isym;	/*!< Galileo: current symbol (= primary code period) */
+	int secCode;	/*!< Galileo: current E1-C secondary code chip (+1/-1) */
 	double azel[2];
 	range_t rho0;
 } channel_t;

@@ -1,8 +1,10 @@
 # GPS-SDR-SIM
 
-GPS-SDR-SIM generates GPS baseband signal data streams, which can be converted 
+GPS-SDR-SIM generates GPS L1 C/A and Galileo E1 OS baseband signal data streams, which can be converted 
 to RF using software-defined radio (SDR) platforms, such as 
 [ADALM-Pluto](https://wiki.analog.com/university/tools/pluto), [bladeRF](http://nuand.com/), [HackRF](https://github.com/mossmann/hackrf/wiki), and [USRP](http://www.ettus.com/).
+Both constellations share the 1575.42 MHz carrier, so a single output file carries GPS and Galileo
+(see [Galileo E1](#galileo-e1)).
 
 ### Windows build instructions
 
@@ -73,7 +75,9 @@ for bladeRF to playback the compressed file.
 ```
 Usage: gps-sdr-sim [options]
 Options:
-  -e <gps_nav>     RINEX navigation file for GPS ephemerides (required)
+  -e <gps_nav>     RINEX navigation file: RINEX 2 GPS, or RINEX 3 GPS/Galileo/mixed (required)
+  -C <systems>     Constellations to simulate: G (GPS), E (Galileo), e.g. GE
+                   (default: every constellation found in the navigation file)
   -u <user_motion> User motion file in ECEF x, y, z format (dynamic mode)
   -x <user_motion> User motion file in lat, lon, height format (dynamic mode)
   -g <nmea_gga>    NMEA GGA stream (dynamic mode)
@@ -84,9 +88,10 @@ Options:
   -T <date,time>   Overwrite TOC and TOE to scenario start time
   -d <duration>    Duration [sec] (dynamic mode max: 300 static mode max: 86400)
   -o <output>      I/Q sampling data file (default: gpssim.bin ; use - for stdout)
-  -s <frequency>   Sampling frequency [Hz] (default: 2600000)
+  -s <frequency>   Sampling frequency [Hz] (default: 2600000, 5000000 with Galileo)
   -b <iq_bits>     I/Q data format [1/8/16] (default: 16)
   -i               Disable ionospheric delay for spacecraft scenario
+  -a               Add tropospheric delay (Saastamoinen, standard atmosphere)
   -p [fixed_gain]  Disable path loss and hold power level constant
   -v               Show details about simulated channels
 ```
@@ -108,6 +113,53 @@ The user motion can be specified in either dynamic or static mode:
 ```
 > gps-sdr-sim -e brdc3540.14n -l 30.286502,120.032669,100
 ```
+
+### Galileo E1
+
+Galileo satellites are simulated when the navigation file is a RINEX 3 file with Galileo
+ephemerides, such as the daily merged broadcast file `BRDC00IGS_R_YYYYDDD0000_01D_MN.rnx`
+(available from [CDDIS](https://cddis.nasa.gov/archive/gnss/data/daily/) or
+[BKG](https://igs.bkg.bund.de/root_ftp/IGS/BRDC/)). GPS and Galileo are both simulated by default
+when both are present; `-C` selects the constellations:
+
+```
+> gps-sdr-sim -e BRDC00IGS_R_20263000000_01D_MN.rnx -l 45.07,7.66,250 -t 2026/10/27,10:00:00
+> gps-sdr-sim -e BRDC00IGS_R_20263000000_01D_MN.rnx -C E -l 45.07,7.66,250
+> gps-sdr-sim -e BRDC00IGS_R_20263000000_01D_MN.rnx -C G -l 45.07,7.66,250
+```
+
+RINEX 2 GPS files keep working as before, and GPS output is unchanged.
+
+The simulated Galileo signal is:
+
+* E1-B (data, I/NAV message) and E1-C (pilot, CS25 secondary code) with the primary codes of the
+  Galileo OS SIS ICD (`galcodes.h`), on a BOC(1,1) sub-carrier. The BOC(6,1) part of CBOC, which
+  carries 1/11 of the power, is not generated; receivers designed for CBOC track it with a small loss.
+* I/NAV nominal pages on E1-B, with FEC encoding, interleaving, CRC-24Q and secondary synchronisation
+  patterns. Word types 1 to 6 carry the ephemeris, clock, ionospheric, BGD, health, GST and GST-UTC
+  data of the RINEX file, word types 7 to 10 an almanac derived from the ephemerides and the GST-GPS
+  offset, and word type 0 the GST. Word types 16 to 22 (reduced CED, FEC2, ARAIM) are sent as spare
+  words, the OSNMA field is empty and the SAR field carries spare data.
+* Satellites flagged with an E1-B signal health status other than "OK" are not simulated.
+
+Limitations:
+
+* Galileo System Time is assumed equal to GPS time; the GST-GPS offset of the RINEX file is only
+  broadcast.
+* The ionospheric delay of every satellite follows the GPS Klobuchar model. A Galileo-only receiver
+  applying NeQuick sees a residual error of a few meters.
+* The BOC(1,1) spectrum needs a sampling frequency of at least 4 MHz, so the default becomes 5 MHz
+  when Galileo is simulated. `bladeplayer`, `hackplayer` and `plutoplayer` replay at a fixed 2.6 MHz:
+  use them with `-s 2600000`, or replay 5 MHz files with `hackrf_transfer -s 5000000`,
+  `bladeRF-cli` (`set samplerate 5M`) or `limeplayer -s 5000000`.
+
+### Tropospheric delay
+
+By default no tropospheric delay is simulated, while receivers correct it with their own model.
+The position they compute is then biased by a few meters, mostly in height. `-a` adds the
+Saastamoinen delay with a standard atmosphere (15 °C and 1013.25 hPa at sea level, 70% relative
+humidity, 1/cos(z) mapping), the default model of RTKLIB, to every GPS and Galileo satellite.
+The remaining error depends on how close the receiver model is to this one.
 
 ### Transmitting the samples
 

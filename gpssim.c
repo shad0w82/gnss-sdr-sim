@@ -11,6 +11,7 @@
 #include <unistd.h>
 #endif
 #include "gpssim.h"
+#include "galcodes.h"
 
 int sinTable512[] = {
 	   2,   5,   8,  11,  14,  17,  20,  23,  26,  29,  32,  35,  38,  41,  44,  47,
@@ -90,9 +91,25 @@ double ant_pat_db[37] = {
 	31.56
 };
 
-int allocatedSat[MAX_SAT];
+// Galileo E1-C secondary code CS25_1
+const int galCs25[GAL_SEC_CODE_LEN] = {
+	0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 1, 1, 0, 1, 1, 0, 0, 1, 0
+};
+
+// Allocated channel per satellite: GPS PRN 1..32 at [0..31], Galileo SVID 1..36 at [32..67]
+int allocatedSat[MAX_SAT+MAX_SAT_GAL];
 
 double xyz[USER_MOTION_SIZE][3];
+
+// Galileo ephemeris records per satellite, and the set currently in use
+ephem_t galeph[MAX_SAT_GAL][MAX_GAL_EPH];
+int galneph[MAX_SAT_GAL];
+ephem_t galcur[MAX_SAT_GAL];
+
+galutc_t galutc;
+galalm_t galalm[MAX_SAT_GAL];
+int galt0a; // Almanac reference time of week [sec]
+int galwna; // Almanac reference week (GPS-aligned)
 
 /*! \brief Subtract two vectors of double
  *  \param[out] y Result of subtraction
@@ -1179,6 +1196,403 @@ int readRinexNavAll(ephem_t eph[][MAX_SAT], ionoutc_t *ionoutc, const char *fnam
 	return(ieph);
 }
 
+/*! \brief Read a numeric field of a RINEX line
+ *  \param[in] str Text line
+ *  \param[in] col Start column (0-based)
+ *  \param[in] width Field width (max 19)
+ *  \returns Field value, 0 if the line is too short
+ */
+double rinexField(const char *str, int col, int width)
+{
+	char tmp[20];
+
+	if ((int)strlen(str)<=col)
+		return(0.0);
+
+	strncpy(tmp, str+col, width);
+	tmp[width] = 0;
+	replaceExpDesignator(tmp, width);
+
+	return(atof(tmp));
+}
+
+/*! \brief Get the RINEX version number from the file header
+ *  \returns Version number, or -1 if the file cannot be opened
+ */
+double rinexVersion(const char *fname)
+{
+	FILE *fp;
+	char str[MAX_CHAR];
+	double ver = 0.0;
+
+	if (NULL==(fp=fopen(fname, "rt")))
+		return(-1.0);
+
+	if (NULL!=fgets(str, MAX_CHAR, fp))
+		ver = rinexField(str, 0, 9);
+
+	fclose(fp);
+
+	return(ver);
+}
+
+/*! \brief Fill an ephemeris structure from a RINEX 3 broadcast orbit record
+ *  \param[out] eph Ephemeris
+ *  \param[in] v Record values: v[1..3] clock, v[4*k..4*k+3] broadcast orbit k (k=1..7)
+ *  \param[in] t Epoch of the record (time of clock)
+ *  \param[in] sys Constellation of the record
+ */
+void rinex3ToEph(ephem_t *eph, const double *v, datetime_t t, int sys)
+{
+	eph->t = t;
+	date2gps(&t, &eph->toc);
+
+	eph->af0 = v[1];
+	eph->af1 = v[2];
+	eph->af2 = v[3];
+	eph->iode = (int)v[4];
+	eph->crs = v[5];
+	eph->deltan = v[6];
+	eph->m0 = v[7];
+	eph->cuc = v[8];
+	eph->ecc = v[9];
+	eph->cus = v[10];
+	eph->sqrta = v[11];
+	eph->toe.sec = v[12];
+	eph->cic = v[13];
+	eph->omg0 = v[14];
+	eph->cis = v[15];
+	eph->inc0 = v[16];
+	eph->crc = v[17];
+	eph->aop = v[18];
+	eph->omgdot = v[19];
+	eph->idot = v[20];
+	eph->codeL2 = (int)v[21];
+	eph->toe.week = (int)v[22];
+	eph->svhlth = (int)v[25];
+
+	if (sys==SYS_GAL)
+	{
+		eph->iodc = eph->iode; // IODnav
+		eph->sisa = v[24];
+		eph->bgda = v[26];
+		eph->tgd = v[27]; // BGD E1-E5b, applies to single-frequency E1
+	}
+	else
+	{
+		if ((eph->svhlth>0) && (eph->svhlth<32))
+			eph->svhlth += 32; // Set MSB to 1
+		eph->tgd = v[26];
+		eph->iodc = (int)v[27];
+	}
+
+	eph->vflg = 1;
+
+	// Update the working variables
+	eph->A = eph->sqrta * eph->sqrta;
+	eph->n = sqrt(((sys==SYS_GAL)?GM_EARTH_GAL:GM_EARTH)/(eph->A*eph->A*eph->A)) + eph->deltan;
+	eph->sq1e2 = sqrt(1.0 - eph->ecc*eph->ecc);
+	eph->omgkdot = eph->omgdot - OMEGA_EARTH;
+
+	return;
+}
+
+/*! \brief GPS ephemeris record with its satellite index, used for sorting */
+typedef struct
+{
+	int sv;
+	ephem_t eph;
+} ephrec_t;
+
+int compareEphToc(const void *a, const void *b)
+{
+	double dt = subGpsTime(((const ephrec_t *)a)->eph.toc, ((const ephrec_t *)b)->eph.toc);
+
+	return((dt>0.0)-(dt<0.0));
+}
+
+/*! \brief Read GPS and Galileo ephemerides from a RINEX 3 navigation file
+ *  \param[out] eph Array of GPS ephemeris sets (same layout as readRinexNavAll)
+ *  \param[out] ionoutc GPS ionospheric and UTC parameters
+ *  \param[in] fname File name of the RINEX 3 file
+ *  \returns Number of GPS sets of ephemerides, -1 on error
+ *
+ *  Galileo I/NAV records are stored per satellite in galeph[][] and the
+ *  Galileo parameters in galutc.
+ */
+int readRinex3Nav(ephem_t eph[][MAX_SAT], ionoutc_t *ionoutc, const char *fname)
+{
+	FILE *fp;
+	int ieph;
+	int sv,k,j,i;
+	char str[MAX_CHAR];
+	char sys;
+	double v[32];
+	datetime_t t;
+	gpstime_t g0;
+	ephem_t tmp;
+	ephrec_t *geph = NULL; // GPS records, sorted by time of clock before grouping
+	int ngeph = 0, maxgeph = 0;
+	int flags = 0x0;
+
+	if (NULL==(fp=fopen(fname, "rt")))
+		return(-1);
+
+	// Clear valid flag
+	for (ieph=0; ieph<EPHEM_ARRAY_SIZE; ieph++)
+		for (sv=0; sv<MAX_SAT; sv++)
+			eph[ieph][sv].vflg = 0;
+
+	for (sv=0; sv<MAX_SAT_GAL; sv++)
+		galneph[sv] = 0;
+
+	galutc.vflg = FALSE;
+
+	// Read header lines
+	while (1)
+	{
+		if (NULL==fgets(str, MAX_CHAR, fp))
+			break;
+
+		if (strncmp(str+60, "END OF HEADER", 13)==0)
+			break;
+		else if (strncmp(str+60, "IONOSPHERIC CORR", 16)==0)
+		{
+			if (strncmp(str, "GPSA", 4)==0)
+			{
+				ionoutc->alpha0 = rinexField(str, 5, 12);
+				ionoutc->alpha1 = rinexField(str, 17, 12);
+				ionoutc->alpha2 = rinexField(str, 29, 12);
+				ionoutc->alpha3 = rinexField(str, 41, 12);
+				flags |= 0x1;
+			}
+			else if (strncmp(str, "GPSB", 4)==0)
+			{
+				ionoutc->beta0 = rinexField(str, 5, 12);
+				ionoutc->beta1 = rinexField(str, 17, 12);
+				ionoutc->beta2 = rinexField(str, 29, 12);
+				ionoutc->beta3 = rinexField(str, 41, 12);
+				flags |= 0x1<<1;
+			}
+			else if (strncmp(str, "GAL ", 4)==0)
+			{
+				galutc.ai0 = rinexField(str, 5, 12);
+				galutc.ai1 = rinexField(str, 17, 12);
+				galutc.ai2 = rinexField(str, 29, 12);
+				galutc.vflg = TRUE;
+			}
+		}
+		else if (strncmp(str+60, "TIME SYSTEM CORR", 16)==0)
+		{
+			if (strncmp(str, "GPUT", 4)==0)
+			{
+				ionoutc->A0 = rinexField(str, 5, 17);
+				ionoutc->A1 = rinexField(str, 22, 16);
+				ionoutc->tot = (int)rinexField(str, 38, 7);
+				ionoutc->wnt = (int)rinexField(str, 45, 5);
+
+				if (ionoutc->tot%4096==0)
+					flags |= 0x1<<2;
+			}
+			else if (strncmp(str, "GAUT", 4)==0)
+			{
+				galutc.A0 = rinexField(str, 5, 17);
+				galutc.A1 = rinexField(str, 22, 16);
+				galutc.tot = (int)rinexField(str, 38, 7);
+				galutc.wnt = (int)rinexField(str, 45, 5);
+			}
+			else if (strncmp(str, "GAGP", 4)==0)
+			{
+				galutc.A0G = rinexField(str, 5, 17);
+				galutc.A1G = rinexField(str, 22, 16);
+				galutc.t0g = (int)rinexField(str, 38, 7);
+				galutc.wn0g = (int)rinexField(str, 45, 5);
+			}
+		}
+		else if (strncmp(str+60, "LEAP SECONDS", 12)==0)
+		{
+			ionoutc->dtls = (int)rinexField(str, 0, 6);
+
+			flags |= 0x1<<3;
+		}
+	}
+
+	ionoutc->vflg = FALSE;
+	if (flags==0xF) // Read all Iono/UTC lines
+		ionoutc->vflg = TRUE;
+
+	// Read ephemeris records
+	if (NULL==fgets(str, MAX_CHAR, fp))
+		str[0] = 0;
+
+	while (str[0]!=0)
+	{
+		// Skip continuation lines of records we do not use
+		if (str[0]==' ' || str[0]=='\n' || str[0]=='\r')
+		{
+			if (NULL==fgets(str, MAX_CHAR, fp))
+				break;
+			continue;
+		}
+
+		sys = str[0];
+
+		if (sys!='G' && sys!='E')
+		{
+			if (NULL==fgets(str, MAX_CHAR, fp))
+				break;
+			continue;
+		}
+
+		sv = (int)rinexField(str, 1, 2)-1;
+
+		// Epoch
+		t.y = (int)rinexField(str, 4, 4);
+		t.m = (int)rinexField(str, 9, 2);
+		t.d = (int)rinexField(str, 12, 2);
+		t.hh = (int)rinexField(str, 15, 2);
+		t.mm = (int)rinexField(str, 18, 2);
+		t.sec = rinexField(str, 21, 2);
+
+		// SV clock
+		v[0] = 0.0;
+		for (j=1; j<4; j++)
+			v[j] = rinexField(str, 4+19*j, 19);
+
+		// Broadcast orbit 1 to 7
+		for (k=1; k<8; k++)
+		{
+			if (NULL==fgets(str, MAX_CHAR, fp))
+				break;
+
+			for (j=0; j<4; j++)
+				v[4*k+j] = rinexField(str, 4+19*j, 19);
+		}
+
+		if (k<8)
+			break; // Truncated record
+
+		if (sys=='G' && sv>=0 && sv<MAX_SAT)
+		{
+			if (ngeph>=maxgeph)
+			{
+				ephrec_t *p;
+
+				maxgeph = (maxgeph==0) ? 1024 : maxgeph*2;
+				p = (ephrec_t *)realloc(geph, maxgeph*sizeof(ephrec_t));
+				if (p==NULL)
+				{
+					fprintf(stderr, "ERROR: Failed to allocate ephemeris buffer.\n");
+					exit(1);
+				}
+				geph = p;
+			}
+
+			geph[ngeph].sv = sv;
+			rinex3ToEph(&geph[ngeph].eph, v, t, SYS_GPS);
+			ngeph++;
+		}
+		else if (sys=='E' && sv>=0 && sv<MAX_SAT_GAL)
+		{
+			// Keep I/NAV records only (data source bit 0: E1-B, bit 2: E5b)
+			if (((int)v[21] & 0x5) && galneph[sv]<MAX_GAL_EPH)
+			{
+				rinex3ToEph(&tmp, v, t, SYS_GAL);
+
+				// Skip duplicates of the same batch
+				for (i=0; i<galneph[sv]; i++)
+				{
+					if (galeph[sv][i].iode==tmp.iode && subGpsTime(galeph[sv][i].toe, tmp.toe)==0.0)
+						break;
+				}
+
+				if (i==galneph[sv])
+					galeph[sv][galneph[sv]++] = tmp;
+			}
+		}
+
+		if (NULL==fgets(str, MAX_CHAR, fp))
+			break;
+	}
+
+	fclose(fp);
+
+	// Group the GPS records into sets of ephemerides as in readRinexNavAll()
+	if (ngeph>0)
+		qsort(geph, ngeph, sizeof(ephrec_t), compareEphToc);
+
+	g0.week = -1;
+	ieph = 0;
+
+	for (i=0; i<ngeph; i++)
+	{
+		if (g0.week==-1)
+			g0 = geph[i].eph.toc;
+
+		if (subGpsTime(geph[i].eph.toc, g0)>SECONDS_IN_HOUR)
+		{
+			g0 = geph[i].eph.toc;
+			ieph++; // a new set of ephemerides
+
+			if (ieph>=EPHEM_ARRAY_SIZE)
+			{
+				ieph--; // Keep the sets read so far
+				break;
+			}
+		}
+
+		eph[ieph][geph[i].sv] = geph[i].eph;
+	}
+
+	free(geph);
+
+	if (g0.week>=0)
+		ieph += 1; // Number of sets of ephemerides
+
+	return(ieph);
+}
+
+/*! \brief Select the Galileo ephemerides in use at a given time
+ *  \param[in] g GST (GPS-aligned week)
+ *
+ *  For each satellite the most recent batch with t0e <= g is chosen, within
+ *  the 4-hour validity of Galileo ephemerides. If the scenario starts before
+ *  the first batch, a batch less than 4 hours in the future is accepted.
+ */
+void selectGalEph(gpstime_t g)
+{
+	int sv,i,best;
+	double dt,bestdt;
+
+	for (sv=0; sv<MAX_SAT_GAL; sv++)
+	{
+		best = -1;
+		bestdt = 0.0;
+
+		for (i=0; i<galneph[sv]; i++)
+		{
+			dt = subGpsTime(g, galeph[sv][i].toe);
+
+			if (dt<-4.0*SECONDS_IN_HOUR || dt>4.0*SECONDS_IN_HOUR)
+				continue;
+
+			// Prefer past batches (dt >= 0) with the smallest age
+			if (best<0 || (dt>=0.0 && (bestdt<0.0 || dt<bestdt)) || (dt<0.0 && bestdt<0.0 && dt>bestdt))
+			{
+				best = i;
+				bestdt = dt;
+			}
+		}
+
+		if (best>=0)
+			galcur[sv] = galeph[sv][best];
+		else
+			galcur[sv].vflg = 0;
+	}
+
+	return;
+}
+
 double ionosphericDelay(const ionoutc_t *ionoutc, gpstime_t g, double *llh, double *azel)
 {
 	double iono_delay = 0.0;
@@ -1256,6 +1670,34 @@ double ionosphericDelay(const ionoutc_t *ionoutc, gpstime_t g, double *llh, doub
 	return (iono_delay);
 }
 
+/*! \brief Compute the tropospheric delay with the Saastamoinen model
+ *  \param[in] llh Receiver latitude, longitude [rad] and ellipsoidal height [m]
+ *  \param[in] azel Satellite azimuth and elevation [rad]
+ *  \returns Tropospheric delay [m]
+ *
+ *  Standard atmosphere (15 deg C and 1013.25 hPa at sea level, relative
+ *  humidity 70%) and 1/cos(z) mapping, as the default model of RTKLIB.
+ */
+double tropoDelay(const double *llh, const double *azel)
+{
+	const double humi = 0.7;
+	double hgt,pres,temp,e,z;
+
+	if (llh[2]<-100.0 || llh[2]>1.0e4 || azel[1]<=0.0)
+		return(0.0);
+
+	hgt = (llh[2]<0.0) ? 0.0 : llh[2];
+
+	pres = 1013.25*pow(1.0-2.2557e-5*hgt, 5.2568);
+	temp = 15.0 - 6.5e-3*hgt + 273.16;
+	e = 6.108*humi*exp((17.15*temp-4684.0)/(temp-38.45));
+
+	z = PI/2.0 - azel[1];
+
+	return(0.0022768*pres/(1.0-0.00266*cos(2.0*llh[0])-0.00028*hgt/1.0e3)/cos(z)  // Hydrostatic
+		+ 0.002277*(1255.0/temp+0.05)*e/cos(z)); // Wet
+}
+
 /*! \brief Compute range between a satellite and the receiver
  *  \param[out] rho The computed range
  *  \param[in] eph Ephemeris data of the satellite
@@ -1318,6 +1760,10 @@ void computeRange(range_t *rho, ephem_t eph, ionoutc_t *ionoutc, gpstime_t g, do
 	rho->iono_delay = ionosphericDelay(ionoutc, g, llh, rho->azel);
 	rho->range += rho->iono_delay;
 
+	// Add tropospheric delay
+	rho->tropo_delay = (ionoutc->tropo==TRUE) ? tropoDelay(llh, rho->azel) : 0.0;
+	rho->range += rho->tropo_delay;
+
 	return;
 }
 
@@ -1338,6 +1784,29 @@ void computeCodePhase(channel_t *chan, range_t rho1, double dt)
 	// Carrier and code frequency.
 	chan->f_carr = -rhorate/LAMBDA_L1;
 	chan->f_code = CODE_FREQ + chan->f_carr*CARR_TO_CODE;
+
+	if (chan->sys==SYS_GAL)
+	{
+		// Time since the start of the symbol buffer (1 s before g0), 1 symbol = 1 code = 4 ms
+		ms = ((subGpsTime(chan->rho0.g,chan->g0)+1.0) - chan->rho0.range/SPEED_OF_LIGHT)*1000.0;
+
+		chan->isym = (int)(ms/4.0);
+		chan->code_phase = (ms/4.0-(double)chan->isym)*GAL_CODE_LEN; // in chip
+
+		if (chan->isym<0 || chan->isym>=GAL_SYM_BUF)
+		{
+			fprintf(stderr, "\nWARNING: Galileo symbol index out of range.\n");
+			chan->isym = (chan->isym<0) ? 0 : GAL_SYM_BUF-1;
+		}
+
+		chan->dataBit = 1-2*chan->sym[chan->isym];
+		chan->secCode = 1-2*galCs25[chan->isym%GAL_SEC_CODE_LEN];
+
+		// Save current pseudorange
+		chan->rho0 = rho1;
+
+		return;
+	}
 
 	// Initial code phase and data bit counters.
 	ms = ((subGpsTime(chan->rho0.g,chan->g0)+6.0) - chan->rho0.range/SPEED_OF_LIGHT)*1000.0;
@@ -1601,6 +2070,432 @@ int generateNavMsg(gpstime_t g, channel_t *chan, int init)
 	return(1);
 }
 
+/*! \brief Generate the Galileo E1-B and E1-C primary codes
+ *  \param[out] e1b E1-B code chips (+1/-1)
+ *  \param[out] e1c E1-C code chips (+1/-1)
+ *  \param[in] prn PRN number (1..50)
+ */
+void galcodegen(int *e1b, int *e1c, int prn)
+{
+	const char *hex[2];
+	int *code[2];
+	int i,j,k,nib;
+	char c;
+
+	if (prn<1 || prn>50)
+		return;
+
+	hex[0] = galE1BCodeHex[prn-1];
+	hex[1] = galE1CCodeHex[prn-1];
+	code[0] = e1b;
+	code[1] = e1c;
+
+	for (k=0; k<2; k++)
+	{
+		for (i=0; i<GAL_CODE_LEN/4; i++)
+		{
+			c = hex[k][i];
+			nib = (c<='9') ? (c-'0') : (c-'A'+10);
+
+			for (j=0; j<4; j++)
+				code[k][i*4+j] = ((nib>>(3-j))&0x1) ? -1 : 1; // Logic 1 -> -1, logic 0 -> +1
+		}
+	}
+
+	return;
+}
+
+/*! \brief Write a value MSB first into an array of bits
+ *  \returns Position following the written field
+ */
+int setBits(unsigned char *bits, int pos, unsigned long long val, int nbits)
+{
+	int i;
+
+	for (i=0; i<nbits; i++)
+		bits[pos+i] = (unsigned char)((val>>(nbits-1-i))&0x1ULL);
+
+	return(pos+nbits);
+}
+
+/*! \brief Round x/2^-n to an integer (two's complement when written with setBits) */
+unsigned long long galScale(double x, int n)
+{
+	return((unsigned long long)(long long)floor(ldexp(x, n)+0.5));
+}
+
+/*! \brief CRC-24Q of an array of bits (Galileo OS SIS ICD 5.1.9.4) */
+unsigned long crc24q(const unsigned char *bits, int nbits)
+{
+	unsigned long crc = 0UL;
+	int i;
+
+	for (i=0; i<nbits; i++)
+	{
+		crc ^= ((unsigned long)bits[i])<<23;
+		crc <<= 1;
+		if (crc&0x1000000UL)
+			crc ^= 0x1864CFBUL;
+	}
+
+	return(crc&0xFFFFFFUL);
+}
+
+/*! \brief Convert SISA in meters to the SISA index (Galileo OS SIS ICD Table 89) */
+int galSisaIndex(double sisa)
+{
+	int idx;
+
+	if (sisa<0.0)
+		idx = 255; // No accuracy prediction available
+	else if (sisa<0.5)
+		idx = (int)floor(sisa/0.01+0.5);
+	else if (sisa<1.0)
+		idx = 50 + (int)floor((sisa-0.5)/0.02+0.5);
+	else if (sisa<2.0)
+		idx = 75 + (int)floor((sisa-1.0)/0.04+0.5);
+	else if (sisa<=6.0)
+		idx = 100 + (int)floor((sisa-2.0)/0.16+0.5);
+	else
+		idx = 255;
+
+	return(idx);
+}
+
+/*! \brief Wrap an angle to [-pi, pi) */
+double wrapPi(double a)
+{
+	a = fmod(a+PI, 2.0*PI);
+	if (a<0.0)
+		a += 2.0*PI;
+
+	return(a-PI);
+}
+
+/*! \brief Build the Galileo almanac from the ephemerides in use
+ *  \param[in] g Time used to set the almanac reference time t0a
+ */
+void galAlmanac(gpstime_t g)
+{
+	const double sqrtanom = sqrt(29600000.0); // Nominal semi-major axis
+	const double inom = 56.0/R2D; // Nominal inclination
+	ephem_t *e;
+	galalm_t *a;
+	double dt;
+	int sv;
+
+	galt0a = ((int)g.sec/600)*600;
+	galwna = g.week;
+
+	for (sv=0; sv<MAX_SAT_GAL; sv++)
+	{
+		e = &galcur[sv];
+		a = &galalm[sv];
+		a->svid = 0;
+
+		if (e->vflg!=1)
+			continue;
+
+		a->dsqrta = e->sqrta - sqrtanom;
+		a->ecc = e->ecc;
+
+		// Skip satellites the almanac cannot represent (e.g. E14, E18 in eccentric orbits)
+		if (fabs(a->dsqrta)>=8.0 || a->ecc>=0.03)
+			continue;
+
+		dt = (double)galt0a - e->toe.sec + (galwna-e->toe.week)*SECONDS_IN_WEEK;
+
+		a->svid = sv+1;
+		a->aop = e->aop;
+		a->di = e->inc0 + e->idot*dt - inom;
+		a->omg0 = wrapPi(e->omg0 + e->omgdot*dt);
+		a->omgdot = e->omgdot;
+		a->m0 = wrapPi(e->m0 + e->n*dt);
+
+		dt = (double)galt0a - e->toc.sec + (galwna-e->toc.week)*SECONDS_IN_WEEK;
+		a->af0 = e->af0 + e->af1*dt;
+		a->af1 = e->af1;
+		a->hs = (e->svhlth>>1)&0x3; // E1-B health status
+	}
+
+	return;
+}
+
+/*! \brief Write the orbital part of a Galileo almanac entry (SVID to Omega dot) */
+int setGalAlmOrbit(unsigned char *w, int pos, const galalm_t *a)
+{
+	pos = setBits(w, pos, a->svid, 6);
+	pos = setBits(w, pos, galScale(a->dsqrta, 9), 13);
+	pos = setBits(w, pos, galScale(a->ecc, 16), 11);
+	pos = setBits(w, pos, galScale(a->aop/PI, 15), 16);
+	pos = setBits(w, pos, galScale(a->di/PI, 14), 11);
+	pos = setBits(w, pos, galScale(a->omg0/PI, 15), 16);
+	pos = setBits(w, pos, galScale(a->omgdot/PI, 33), 11);
+
+	return(pos);
+}
+
+/*! \brief Write the clock and health part of a Galileo almanac entry */
+int setGalAlmClock(unsigned char *w, int pos, const galalm_t *a)
+{
+	pos = setBits(w, pos, galScale(a->af0, 19), 16);
+	pos = setBits(w, pos, galScale(a->af1, 38), 13);
+	pos = setBits(w, pos, a->hs, 2); // E5bHS
+	pos = setBits(w, pos, a->hs, 2); // E1BHS
+
+	return(pos);
+}
+
+/*! \brief Generate a Galileo I/NAV word
+ *  \param[out] w 128 bits of the word
+ *  \param[in] type Word type (0 to 10)
+ *  \param[in] eph Ephemeris of the transmitting satellite
+ *  \param[in] svid SVID of the transmitting satellite
+ *  \param[in] ionoutc GPS iono/UTC parameters (leap seconds)
+ *  \param[in] gp GST at the start of the page carrying the word
+ *  \param[in] alm Index of the first of the three almanacs of word types 7 to 10
+ */
+void galWord(unsigned char *w, int type, const ephem_t *eph, int svid, const ionoutc_t *ionoutc, gpstime_t gp, int alm)
+{
+	unsigned long wn,tow;
+	unsigned long wnlsf,dn,dtlsf;
+	const galalm_t *a1,*a2,*a3;
+	int iodnav,iod_a,wna,hs,dvs;
+	int pos = 0;
+
+	memset(w, 0, 128);
+
+	wn = (unsigned long)(gp.week-GAL_WEEK_OFFSET) & 0xFFFUL;
+	tow = (unsigned long)(gp.sec+0.5);
+	iodnav = eph->iode & 0x3FF;
+	iod_a = (galt0a/600) & 0xF;
+	wna = (galwna-GAL_WEEK_OFFSET) & 0x3;
+	hs = (eph->svhlth>>1)&0x3; // RINEX: bit 0 E1-B DVS, bits 1-2 E1-B HS
+	dvs = eph->svhlth&0x1;
+
+	a1 = &galalm[alm%MAX_SAT_GAL];
+	a2 = &galalm[(alm+1)%MAX_SAT_GAL];
+	a3 = &galalm[(alm+2)%MAX_SAT_GAL];
+
+	pos = setBits(w, pos, type, 6);
+
+	switch (type)
+	{
+	case 1: // Ephemeris (1/4)
+		pos = setBits(w, pos, iodnav, 10);
+		pos = setBits(w, pos, (unsigned long)(eph->toe.sec/60.0+0.5), 14);
+		pos = setBits(w, pos, galScale(eph->m0/PI, 31), 32);
+		pos = setBits(w, pos, galScale(eph->ecc, 33), 32);
+		pos = setBits(w, pos, galScale(eph->sqrta, 19), 32);
+		break;
+	case 2: // Ephemeris (2/4)
+		pos = setBits(w, pos, iodnav, 10);
+		pos = setBits(w, pos, galScale(eph->omg0/PI, 31), 32);
+		pos = setBits(w, pos, galScale(eph->inc0/PI, 31), 32);
+		pos = setBits(w, pos, galScale(eph->aop/PI, 31), 32);
+		pos = setBits(w, pos, galScale(eph->idot/PI, 43), 14);
+		break;
+	case 3: // Ephemeris (3/4) and SISA
+		pos = setBits(w, pos, iodnav, 10);
+		pos = setBits(w, pos, galScale(eph->omgdot/PI, 43), 24);
+		pos = setBits(w, pos, galScale(eph->deltan/PI, 43), 16);
+		pos = setBits(w, pos, galScale(eph->cuc, 29), 16);
+		pos = setBits(w, pos, galScale(eph->cus, 29), 16);
+		pos = setBits(w, pos, galScale(eph->crc, 5), 16);
+		pos = setBits(w, pos, galScale(eph->crs, 5), 16);
+		pos = setBits(w, pos, galSisaIndex(eph->sisa), 8);
+		break;
+	case 4: // SVID, ephemeris (4/4) and clock correction
+		pos = setBits(w, pos, iodnav, 10);
+		pos = setBits(w, pos, svid, 6);
+		pos = setBits(w, pos, galScale(eph->cic, 29), 16);
+		pos = setBits(w, pos, galScale(eph->cis, 29), 16);
+		pos = setBits(w, pos, (unsigned long)(eph->toc.sec/60.0+0.5), 14);
+		pos = setBits(w, pos, galScale(eph->af0, 34), 31);
+		pos = setBits(w, pos, galScale(eph->af1, 46), 21);
+		pos = setBits(w, pos, galScale(eph->af2, 59), 6);
+		break;
+	case 5: // Ionospheric correction, BGD, health, GST
+		pos = setBits(w, pos, galScale(galutc.ai0, 2), 11);
+		pos = setBits(w, pos, galScale(galutc.ai1, 8), 11);
+		pos = setBits(w, pos, galScale(galutc.ai2, 15), 14);
+		pos = setBits(w, pos, 0, 5); // Ionospheric disturbance flags
+		pos = setBits(w, pos, galScale(eph->bgda, 32), 10);
+		pos = setBits(w, pos, galScale(eph->tgd, 32), 10);
+		pos = setBits(w, pos, (eph->svhlth>>7)&0x3, 2); // E5bHS
+		pos = setBits(w, pos, hs, 2); // E1BHS
+		pos = setBits(w, pos, (eph->svhlth>>6)&0x1, 1); // E5bDVS
+		pos = setBits(w, pos, dvs, 1); // E1BDVS
+		pos = setBits(w, pos, wn, 12);
+		pos = setBits(w, pos, tow, 20);
+		break;
+	case 6: // GST-UTC conversion
+		if (ionoutc->leapen==TRUE)
+		{
+			wnlsf = (unsigned long)(ionoutc->wnlsf-GAL_WEEK_OFFSET);
+			dn = (unsigned long)(ionoutc->dn);
+			dtlsf = (unsigned long)(ionoutc->dtlsf);
+		}
+		else
+		{
+			wnlsf = 1929-GAL_WEEK_OFFSET; // Same default as the GPS LNAV message
+			dn = 7;
+			dtlsf = 18;
+		}
+		pos = setBits(w, pos, galScale(galutc.A0, 30), 32);
+		pos = setBits(w, pos, galScale(galutc.A1, 50), 24);
+		pos = setBits(w, pos, (unsigned long)ionoutc->dtls, 8);
+		pos = setBits(w, pos, (unsigned long)(galutc.tot/3600), 8);
+		pos = setBits(w, pos, (unsigned long)(galutc.wnt-GAL_WEEK_OFFSET), 8);
+		pos = setBits(w, pos, wnlsf, 8);
+		pos = setBits(w, pos, dn, 3);
+		pos = setBits(w, pos, dtlsf, 8);
+		pos = setBits(w, pos, tow, 20);
+		break;
+	case 7: // Almanac for SVID1 (1/2)
+		pos = setBits(w, pos, iod_a, 4);
+		pos = setBits(w, pos, wna, 2);
+		pos = setBits(w, pos, (unsigned long)(galt0a/600), 10);
+		pos = setGalAlmOrbit(w, pos, a1);
+		pos = setBits(w, pos, galScale(a1->m0/PI, 15), 16);
+		break;
+	case 8: // Almanac for SVID1 (2/2) and SVID2 (1/2)
+		pos = setBits(w, pos, iod_a, 4);
+		pos = setGalAlmClock(w, pos, a1);
+		pos = setGalAlmOrbit(w, pos, a2);
+		break;
+	case 9: // Almanac for SVID2 (2/2) and SVID3 (1/2)
+		pos = setBits(w, pos, iod_a, 4);
+		pos = setBits(w, pos, wna, 2);
+		pos = setBits(w, pos, (unsigned long)(galt0a/600), 10);
+		pos = setBits(w, pos, galScale(a2->m0/PI, 15), 16);
+		pos = setGalAlmClock(w, pos, a2);
+		pos = setBits(w, pos, a3->svid, 6);
+		pos = setBits(w, pos, galScale(a3->dsqrta, 9), 13);
+		pos = setBits(w, pos, galScale(a3->ecc, 16), 11);
+		pos = setBits(w, pos, galScale(a3->aop/PI, 15), 16);
+		pos = setBits(w, pos, galScale(a3->di/PI, 14), 11);
+		break;
+	case 10: // Almanac for SVID3 (2/2) and GST-GPS conversion
+		pos = setBits(w, pos, iod_a, 4);
+		pos = setBits(w, pos, galScale(a3->omg0/PI, 15), 16);
+		pos = setBits(w, pos, galScale(a3->omgdot/PI, 33), 11);
+		pos = setBits(w, pos, galScale(a3->m0/PI, 15), 16);
+		pos = setGalAlmClock(w, pos, a3);
+		pos = setBits(w, pos, galScale(galutc.A0G, 35), 16);
+		pos = setBits(w, pos, galScale(galutc.A1G, 51), 12);
+		pos = setBits(w, pos, (unsigned long)(galutc.t0g/3600), 8);
+		pos = setBits(w, pos, (unsigned long)(galutc.wn0g-GAL_WEEK_OFFSET), 6);
+		break;
+	default: // Spare word with GST
+		pos = setBits(w, pos, 2, 2); // Time = '10': WN and TOW are valid
+		pos = setBits(w, pos, 0, 88);
+		pos = setBits(w, pos, wn, 12);
+		pos = setBits(w, pos, tow, 20);
+		break;
+	}
+
+	return;
+}
+
+/*! \brief FEC encode and interleave a 120-bit I/NAV page part, and add the sync pattern
+ *  \param[in] bits Page part (including the 6 tail bits)
+ *  \param[out] sym 250 symbols
+ */
+void galEncodePagePart(const unsigned char *bits, unsigned char *sym)
+{
+	static const unsigned char sync[10] = {0,1,0,1,1,0,0,0,0,0};
+	unsigned char enc[2*GAL_PART_BITS];
+	unsigned int reg = 0;
+	int i,r,c;
+
+	// Convolutional code: K=7, G1=171o, G2=133o (inverted), G1 first
+	for (i=0; i<GAL_PART_BITS; i++)
+	{
+		reg = ((reg>>1) | ((unsigned int)bits[i]<<6)) & 0x7F;
+		enc[2*i] = (unsigned char)(countBits(reg&0x79)&0x1);
+		enc[2*i+1] = (unsigned char)(1-(countBits(reg&0x5B)&0x1));
+	}
+
+	memcpy(sym, sync, 10);
+
+	// Block interleaver: written in 30 columns of 8 symbols, read in 8 rows
+	for (r=0; r<8; r++)
+		for (c=0; c<30; c++)
+			sym[10+r*30+c] = enc[c*8+r];
+
+	return;
+}
+
+/*! \brief Generate the I/NAV symbols of a Galileo E1-B channel
+ *  \param[in] g Current GST
+ *  \param[in] ionoutc GPS iono/UTC parameters (leap seconds)
+ *  \param chan Channel (sym and g0 are updated)
+ *
+ *  The buffer holds the E1-B page started 1 s before the 30 s sub-frame
+ *  boundary g0, followed by the 15 pages of the sub-frame (Table 38 of the
+ *  Galileo OS SIS ICD). Word types without content in this simulator
+ *  (16 to 22) are replaced by spare words.
+ */
+int generateGalNavMsg(gpstime_t g, const ionoutc_t *ionoutc, channel_t *chan)
+{
+	// Word type per E1-B page; 7 stands for 7 or 9, 8 for 8 or 10
+	static const int pageWord[GAL_N_PAGE] = {0, 2, 4, 6, 7, 8, 0, 0, 0, 0, 0, 1, 3, 5, 0, 0};
+	static const int ssp[3] = {0x2F, 0x04, 0x2B}; // SSP3, SSP1, SSP2 at GST mod 6 = 0, 2, 4
+	unsigned char w[128],even[GAL_PART_BITS],odd[GAL_PART_BITS];
+	unsigned char crcbits[196];
+	const ephem_t *eph;
+	gpstime_t g0,gp;
+	unsigned long crc;
+	int k,type,sfid,alm,tow;
+
+	g0.week = g.week;
+	g0.sec = (double)(((unsigned long)(g.sec+0.5))/30UL) * 30.0; // Align with the sub-frame length = 30 sec
+	chan->g0 = g0;
+
+	eph = &galcur[chan->prn-1];
+
+	// Sub-frame ID within the 720 s frame, and almanacs it carries (Table 39)
+	sfid = (((unsigned long)g0.sec)%720UL)/30 + 1;
+	alm = (18 + 3*((sfid-1)/2)) % MAX_SAT_GAL;
+
+	for (k=0; k<GAL_N_PAGE; k++)
+	{
+		gp = incGpsTime(g0, -1.0+2.0*k); // Page start
+		tow = (int)(gp.sec+0.5);
+
+		type = pageWord[k];
+		if ((type==7 || type==8) && (sfid%2==0))
+			type += 2;
+
+		galWord(w, type, eph, chan->prn, ionoutc, gp, alm);
+
+		// Even part: even/odd, page type, data (1/2), tail
+		memset(even, 0, GAL_PART_BITS);
+		even[0] = 0;
+		even[1] = 0;
+		memcpy(even+2, w, 112);
+
+		// Odd part: even/odd, page type, data (2/2), OSNMA, SAR, spare, CRC, SSP, tail
+		memset(odd, 0, GAL_PART_BITS);
+		odd[0] = 1;
+		odd[1] = 0;
+		memcpy(odd+2, w+112, 16);
+		odd[58] = 1; // Spare SAR data: start bit = 1
+
+		memcpy(crcbits, even, 114);
+		memcpy(crcbits+114, odd, 82);
+		crc = crc24q(crcbits, 196);
+		setBits(odd, 82, crc, 24);
+		setBits(odd, 106, ssp[((tow+1)%6)/2], 8);
+
+		galEncodePagePart(even, chan->sym+(2*k)*GAL_PART_SYMS);
+		galEncodePagePart(odd, chan->sym+(2*k+1)*GAL_PART_SYMS);
+	}
+
+	return(1);
+}
+
 int checkSatVisibility(ephem_t eph, gpstime_t g, double *xyz, double elvMask, double *azel)
 {
 	double llh[3],neu[3];
@@ -1624,24 +2519,54 @@ int checkSatVisibility(ephem_t eph, gpstime_t g, double *xyz, double elvMask, do
 	return (0); // Invisible
 }
 
-int allocateChannel(channel_t *chan, ephem_t *eph, ionoutc_t ionoutc, gpstime_t grx, double *xyz, double elvMask)
+/*! \brief Allocate channels to visible satellites and release the others
+ *  \param chan Channels
+ *  \param[in] eph Current set of GPS ephemerides (Galileo: galcur)
+ *  \param[in] sysmask Enabled constellations (bit SYS_GPS, bit SYS_GAL)
+ *  \returns Number of visible satellites
+ */
+int allocateChannel(channel_t *chan, ephem_t *eph, ionoutc_t ionoutc, gpstime_t grx, double *xyz, double elvMask, int sysmask)
 {
 	int nsat=0;
-	int i,sv;
+	int i,sv,idx,sys,visible;
 	double azel[2];
+	ephem_t *seph;
 
 	range_t rho;
 	double ref[3]={0.0};
 	double r_ref,r_xyz;
 	double phase_ini;
 
-	for (sv=0; sv<MAX_SAT; sv++)
+	for (idx=0; idx<MAX_SAT+MAX_SAT_GAL; idx++)
 	{
-		if(checkSatVisibility(eph[sv], grx, xyz, 0.0, azel)==1)
+		if (idx<MAX_SAT)
+		{
+			sys = SYS_GPS;
+			sv = idx;
+			seph = &eph[sv];
+		}
+		else
+		{
+			sys = SYS_GAL;
+			sv = idx-MAX_SAT;
+			seph = &galcur[sv];
+		}
+
+		visible = 0;
+		if (sysmask & (1<<sys))
+		{
+			visible = (checkSatVisibility(*seph, grx, xyz, 0.0, azel)==1);
+
+			// Skip Galileo satellites flagged with E1-B/C out of service, in test, etc.
+			if (visible && sys==SYS_GAL && ((seph->svhlth>>1)&0x3)!=0)
+				visible = 0;
+		}
+
+		if (visible)
 		{
 			nsat++; // Number of visible satellites
 
-			if (allocatedSat[sv]==-1) // Visible but not allocated
+			if (allocatedSat[idx]==-1) // Visible but not allocated
 			{
 				// Allocated new satellite
 				for (i=0; i<MAX_CHAN; i++)
@@ -1650,26 +2575,42 @@ int allocateChannel(channel_t *chan, ephem_t *eph, ionoutc_t ionoutc, gpstime_t 
 					{
 						// Initialize channel
 						chan[i].prn = sv+1;
+						chan[i].sys = sys;
 						chan[i].azel[0] = azel[0];
 						chan[i].azel[1] = azel[1];
 
-						// C/A code generation
-						codegen(chan[i].ca, chan[i].prn);
+						if (sys==SYS_GAL)
+						{
+							chan[i].code_len = GAL_CODE_LEN;
 
-						// Generate subframe
-						eph2sbf(eph[sv], ionoutc, chan[i].sbf);
+							// E1-B and E1-C code generation
+							galcodegen(chan[i].ca, chan[i].pilot, chan[i].prn);
 
-						// Generate navigation message
-						generateNavMsg(grx, &chan[i], 1);
+							// Generate I/NAV symbols
+							generateGalNavMsg(grx, &ionoutc, &chan[i]);
+						}
+						else
+						{
+							chan[i].code_len = CA_SEQ_LEN;
+
+							// C/A code generation
+							codegen(chan[i].ca, chan[i].prn);
+
+							// Generate subframe
+							eph2sbf(*seph, ionoutc, chan[i].sbf);
+
+							// Generate navigation message
+							generateNavMsg(grx, &chan[i], 1);
+						}
 
 						// Initialize pseudorange
-						computeRange(&rho, eph[sv], &ionoutc, grx, xyz);
+						computeRange(&rho, *seph, &ionoutc, grx, xyz);
 						chan[i].rho0 = rho;
 
 						// Initialize carrier phase
 						r_xyz = rho.range;
 
-						computeRange(&rho, eph[sv], &ionoutc, grx, ref);
+						computeRange(&rho, *seph, &ionoutc, grx, ref);
 						r_ref = rho.range;
 
 						phase_ini = 0.0; // TODO: Must initialize properly
@@ -1687,16 +2628,16 @@ int allocateChannel(channel_t *chan, ephem_t *eph, ionoutc_t ionoutc, gpstime_t 
 
 				// Set satellite allocation channel
 				if (i<MAX_CHAN)
-					allocatedSat[sv] = i;
+					allocatedSat[idx] = i;
 			}
 		}
-		else if (allocatedSat[sv]>=0) // Not visible but allocated
+		else if (allocatedSat[idx]>=0) // Not visible but allocated
 		{
 			// Clear channel
-			chan[allocatedSat[sv]].prn = 0;
+			chan[allocatedSat[idx]].prn = 0;
 
 			// Clear satellite allocation flag
-			allocatedSat[sv] = -1;
+			allocatedSat[idx] = -1;
 		}
 	}
 
@@ -1707,7 +2648,9 @@ void usage(void)
 {
 	fprintf(stderr, "Usage: gps-sdr-sim [options]\n"
 		"Options:\n"
-		"  -e <gps_nav>     RINEX navigation file for GPS ephemerides (required)\n"
+		"  -e <gps_nav>     RINEX navigation file: RINEX 2 GPS, or RINEX 3 GPS/Galileo/mixed (required)\n"
+		"  -C <systems>     Constellations to simulate: G (GPS), E (Galileo), e.g. GE\n"
+		"                   (default: every constellation found in the navigation file)\n"
 		"  -u <user_motion> User motion file in ECEF x, y, z format (dynamic mode)\n"
 		"  -x <user_motion> User motion file in lat, lon, height format (dynamic mode)\n"
 		"  -g <nmea_gga>    NMEA GGA stream (dynamic mode)\n"
@@ -1718,9 +2661,10 @@ void usage(void)
 		"  -T <date,time>   Overwrite TOC and TOE to scenario start time\n"
 		"  -d <duration>    Duration [sec] (dynamic mode max: %.0f, static mode max: %d)\n"
 		"  -o <output>      I/Q sampling data file (default: gpssim.bin)\n"
-		"  -s <frequency>   Sampling frequency [Hz] (default: 2600000)\n"
+		"  -s <frequency>   Sampling frequency [Hz] (default: 2600000, 5000000 with Galileo)\n"
 		"  -b <iq_bits>     I/Q data format [1/8/16] (default: 16)\n"
 		"  -i               Disable ionospheric delay for spacecraft scenario\n"
+		"  -a               Add tropospheric delay (Saastamoinen, standard atmosphere)\n"
 		"  -p [fixed_gain]  Disable path loss and hold power level constant\n"
 		"  -v               Show details about simulated channels\n",
 		((double)USER_MOTION_SIZE) / 10.0, STATIC_MAX_DURATION);
@@ -1742,8 +2686,9 @@ int main(int argc, char *argv[])
 	double llh[3];
 
 	int i;
-	channel_t chan[MAX_CHAN];
+	static channel_t chan[MAX_CHAN]; // Too large for the stack
 	double elvmask = 0.0; // in degree
+	ephem_t *seph;
 
 	int ip,qp;
 	int iTable;
@@ -1756,19 +2701,25 @@ int main(int argc, char *argv[])
 
 	int iumd;
 	int numd;
-	char umfile[MAX_CHAR];
+	char umfile[MAX_PATH_LEN];
 
 
 	int staticLocationMode = FALSE;
 	int nmeaGGA = FALSE;
 	int umLLH = FALSE;
 
-	char navfile[MAX_CHAR];
-	char outfile[MAX_CHAR];
+	char navfile[MAX_PATH_LEN];
+	char outfile[MAX_PATH_LEN];
 
 	double samp_freq;
+	int samp_freq_set = FALSE;
 	int iq_buff_size;
 	int data_format;
+
+	char sysopt[MAX_CHAR];
+	int sysmask; // Enabled constellations (bit SYS_GPS, bit SYS_GAL)
+	int ngal;
+	double rnxver;
 
 	int result;
 
@@ -1800,6 +2751,7 @@ int main(int argc, char *argv[])
 	// Default options
 	navfile[0] = 0;
 	umfile[0] = 0;
+	sysopt[0] = 0;
 	strcpy(outfile, "gpssim.bin");
 	samp_freq = 2.6e6;
 	data_format = SC16;
@@ -1808,6 +2760,7 @@ int main(int argc, char *argv[])
 	duration = (double)iduration/10.0; // Default duration
 	verb = FALSE;
 	ionoutc.enable = TRUE;
+	ionoutc.tropo = FALSE;
 	ionoutc.leapen = FALSE;
 
 	if (argc<3)
@@ -1816,25 +2769,29 @@ int main(int argc, char *argv[])
 		exit(1);
 	}
 
-	while ((result=getopt(argc,argv,"e:u:x:g:c:l:o:s:b:L:T:t:d:ipv"))!=-1)
+	while ((result=getopt(argc,argv,"e:C:u:x:g:c:l:o:s:b:L:T:t:d:iapv"))!=-1)
 	{
 		switch (result)
 		{
 		case 'e':
-			strcpy(navfile, optarg);
+			snprintf(navfile, MAX_PATH_LEN, "%s", optarg);
+			break;
+		case 'C':
+			strncpy(sysopt, optarg, MAX_CHAR-1);
+			sysopt[MAX_CHAR-1] = 0;
 			break;
 		case 'u':
-			strcpy(umfile, optarg);
+			snprintf(umfile, MAX_PATH_LEN, "%s", optarg);
 			nmeaGGA = FALSE;
 			umLLH = FALSE;
 			break;
 		case 'x':
 			// Added by romalvarezllorens@gmail.com
-			strcpy(umfile, optarg);
+			snprintf(umfile, MAX_PATH_LEN, "%s", optarg);
 			umLLH = TRUE;
 			break;
 		case 'g':
-			strcpy(umfile, optarg);
+			snprintf(umfile, MAX_PATH_LEN, "%s", optarg);
 			nmeaGGA = TRUE;
 			break;
 		case 'c':
@@ -1852,7 +2809,7 @@ int main(int argc, char *argv[])
 			llh2xyz(llh,xyz[0]); // Convert llh to xyz
 			break;
 		case 'o':
-			strcpy(outfile, optarg);
+			snprintf(outfile, MAX_PATH_LEN, "%s", optarg);
 			break;
 		case 's':
 			samp_freq = atof(optarg);
@@ -1861,6 +2818,7 @@ int main(int argc, char *argv[])
 				fprintf(stderr, "ERROR: Invalid sampling frequency.\n");
 				exit(1);
 			}
+			samp_freq_set = TRUE;
 			break;
 		case 'b':
 			data_format = atoi(optarg);
@@ -1928,6 +2886,9 @@ int main(int argc, char *argv[])
 		case 'i':
 			ionoutc.enable = FALSE; // Disable ionospheric correction
 			break;
+		case 'a':
+			ionoutc.tropo = TRUE; // Enable tropospheric delay
+			break;
 		case 'p':
 			if (optind < argc && argv[optind][0] != '-') // Check if next item is an argument
 			{
@@ -1974,13 +2935,6 @@ int main(int argc, char *argv[])
 		exit(1);
 	}
 	iduration = (int)(duration*10.0 + 0.5);
-
-	// Buffer size
-	samp_freq = floor(samp_freq/10.0);
-	iq_buff_size = (int)samp_freq; // samples per 0.1sec
-	samp_freq *= 10.0;
-
-	delt = 1.0/samp_freq;
 
 	////////////////////////////////////////////////////////////
 	// Receiver position
@@ -2034,18 +2988,88 @@ int main(int argc, char *argv[])
 	// Read ephemeris
 	////////////////////////////////////////////////////////////
 
-	neph = readRinexNavAll(eph, &ionoutc, navfile);
+	rnxver = rinexVersion(navfile);
 
-	if (neph==0)
+	if (rnxver>=3.0)
 	{
-		fprintf(stderr, "ERROR: No ephemeris available.\n");
-		exit(1);
+		neph = readRinex3Nav(eph, &ionoutc, navfile);
 	}
-	else if (neph==-1)
+	else
+	{
+		neph = readRinexNavAll(eph, &ionoutc, navfile);
+
+		for (sv=0; sv<MAX_SAT_GAL; sv++)
+			galneph[sv] = 0;
+	}
+
+	if (neph==-1)
 	{
 		fprintf(stderr, "ERROR: ephemeris file not found.\n");
 		exit(1);
 	}
+
+	ngal = 0;
+	for (sv=0; sv<MAX_SAT_GAL; sv++)
+		ngal += galneph[sv];
+
+	// Enabled constellations
+	if (sysopt[0]==0)
+	{
+		sysmask = 0;
+		if (neph>0)
+			sysmask |= (1<<SYS_GPS);
+		if (ngal>0)
+			sysmask |= (1<<SYS_GAL);
+	}
+	else
+	{
+		sysmask = 0;
+		for (i=0; sysopt[i]!=0; i++)
+		{
+			if (sysopt[i]=='G' || sysopt[i]=='g')
+				sysmask |= (1<<SYS_GPS);
+			else if (sysopt[i]=='E' || sysopt[i]=='e')
+				sysmask |= (1<<SYS_GAL);
+			else if (sysopt[i]!=',')
+			{
+				fprintf(stderr, "ERROR: Unknown constellation '%c'.\n", sysopt[i]);
+				exit(1);
+			}
+		}
+
+		if ((sysmask & (1<<SYS_GPS)) && neph==0)
+		{
+			fprintf(stderr, "ERROR: No GPS ephemeris in the navigation file.\n");
+			exit(1);
+		}
+		if ((sysmask & (1<<SYS_GAL)) && ngal==0)
+		{
+			fprintf(stderr, "ERROR: No Galileo I/NAV ephemeris in the navigation file.\n");
+			exit(1);
+		}
+	}
+
+	if (sysmask==0)
+	{
+		fprintf(stderr, "ERROR: No ephemeris available.\n");
+		exit(1);
+	}
+
+	fprintf(stderr, "Constellations: %s%s\n",
+		(sysmask & (1<<SYS_GPS)) ? "GPS " : "", (sysmask & (1<<SYS_GAL)) ? "Galileo" : "");
+
+	// Buffer size
+	if ((sysmask & (1<<SYS_GAL)) && samp_freq_set==FALSE)
+		samp_freq = 5.0e6; // Room for the BOC(1,1) main lobes of Galileo E1
+
+	if ((sysmask & (1<<SYS_GAL)) && samp_freq<4.0e6)
+		fprintf(stderr, "WARNING: Sampling frequency below 4 MHz truncates the Galileo E1 BOC(1,1) spectrum.\n");
+
+	samp_freq = floor(samp_freq/10.0);
+	iq_buff_size = (int)samp_freq; // samples per 0.1sec
+	samp_freq *= 10.0;
+
+	delt = 1.0/samp_freq;
 
 	if ((verb==TRUE)&&(ionoutc.vflg==TRUE))
 	{
@@ -2058,16 +3082,8 @@ int main(int argc, char *argv[])
 		fprintf(stderr, "%6d\n", ionoutc.dtls);
 	}
 
-	for (sv=0; sv<MAX_SAT; sv++)
-	{
-		if (eph[0][sv].vflg==1)
-		{
-			gmin = eph[0][sv].toc;
-			tmin = eph[0][sv].t;
-			break;
-		}
-	}
-
+	gmin.sec = 0;
+	gmin.week = 0;
 	gmax.sec = 0;
 	gmax.week = 0;
 	tmax.sec = 0;
@@ -2076,13 +3092,48 @@ int main(int argc, char *argv[])
 	tmax.d = 0;
 	tmax.m = 0;
 	tmax.y = 0;
-	for (sv=0; sv<MAX_SAT; sv++)
+
+	if (sysmask & (1<<SYS_GPS))
 	{
-		if (eph[neph-1][sv].vflg == 1)
+		for (sv=0; sv<MAX_SAT; sv++)
 		{
-			gmax = eph[neph-1][sv].toc;
-			tmax = eph[neph-1][sv].t;
-			break;
+			if (eph[0][sv].vflg==1)
+			{
+				gmin = eph[0][sv].toc;
+				tmin = eph[0][sv].t;
+				break;
+			}
+		}
+
+		for (sv=0; sv<MAX_SAT; sv++)
+		{
+			if (eph[neph-1][sv].vflg == 1)
+			{
+				gmax = eph[neph-1][sv].toc;
+				tmax = eph[neph-1][sv].t;
+				break;
+			}
+		}
+	}
+	else // Galileo only: span of the Galileo records
+	{
+		gmin.week = -1;
+
+		for (sv=0; sv<MAX_SAT_GAL; sv++)
+		{
+			for (i=0; i<galneph[sv]; i++)
+			{
+				if (gmin.week<0 || subGpsTime(galeph[sv][i].toc, gmin)<0.0)
+				{
+					gmin = galeph[sv][i].toc;
+					tmin = galeph[sv][i].t;
+				}
+				if (subGpsTime(galeph[sv][i].toc, gmax)>0.0)
+				{
+					gmax = galeph[sv][i].toc;
+					tmax = galeph[sv][i].t;
+				}
+			}
 		}
 	}
 
@@ -2123,6 +3174,25 @@ int main(int argc, char *argv[])
 					}
 				}
 			}
+
+			for (sv=0; sv<MAX_SAT_GAL; sv++)
+			{
+				for (i=0; i<galneph[sv]; i++)
+				{
+					gtmp = incGpsTime(galeph[sv][i].toc, dsec);
+					gps2date(&gtmp,&ttmp);
+					galeph[sv][i].toc = gtmp;
+					galeph[sv][i].t = ttmp;
+
+					galeph[sv][i].toe = incGpsTime(galeph[sv][i].toe, dsec);
+				}
+			}
+
+			// Galileo UTC and GGTO reference times follow the shifted ephemerides
+			galutc.wnt = g0.week;
+			galutc.tot = ((int)g0.sec/3600)*3600;
+			galutc.wn0g = g0.week;
+			galutc.t0g = ((int)g0.sec/3600)*3600;
 		}
 		else
 		{
@@ -2152,7 +3222,10 @@ int main(int argc, char *argv[])
 	// Select the current set of ephemerides
 	ieph = -1;
 
-	for (i=0; i<neph; i++)
+	if (!(sysmask & (1<<SYS_GPS)))
+		ieph = 0; // No GPS satellites to simulate
+
+	for (i=0; i<neph && ieph<0; i++)
 	{
 		for (sv=0; sv<MAX_SAT; sv++)
 		{
@@ -2175,6 +3248,23 @@ int main(int argc, char *argv[])
 	{
 		fprintf(stderr, "ERROR: No current set of ephemerides has been found.\n");
 		exit(1);
+	}
+
+	if (sysmask & (1<<SYS_GAL))
+	{
+		// Galileo ephemerides in use and almanac at the start time
+		selectGalEph(g0);
+		galAlmanac(g0);
+
+		ngal = 0;
+		for (sv=0; sv<MAX_SAT_GAL; sv++)
+			ngal += galcur[sv].vflg;
+
+		if (ngal==0)
+		{
+			fprintf(stderr, "ERROR: No Galileo ephemeris valid at the start time.\n");
+			exit(1);
+		}
 	}
 
 	////////////////////////////////////////////////////////////
@@ -2230,20 +3320,20 @@ int main(int argc, char *argv[])
 		chan[i].prn = 0;
 
 	// Clear satellite allocation flag
-	for (sv=0; sv<MAX_SAT; sv++)
+	for (sv=0; sv<MAX_SAT+MAX_SAT_GAL; sv++)
 		allocatedSat[sv] = -1;
 
 	// Initial reception time
 	grx = incGpsTime(g0, 0.0);
 
 	// Allocate visible satellites
-	allocateChannel(chan, eph[ieph], ionoutc, grx, xyz[0], elvmask);
+	allocateChannel(chan, eph[ieph], ionoutc, grx, xyz[0], elvmask, sysmask);
 
 	for(i=0; i<MAX_CHAN; i++)
 	{
 		if (chan[i].prn>0)
-			fprintf(stderr, "%02d %6.1f %5.1f %11.1f %5.1f\n", chan[i].prn,
-				chan[i].azel[0]*R2D, chan[i].azel[1]*R2D, chan[i].rho0.d, chan[i].rho0.iono_delay);
+			fprintf(stderr, "%c%02d %6.1f %5.1f %11.1f %5.1f %5.1f\n", (chan[i].sys==SYS_GAL)?'E':'G', chan[i].prn,
+				chan[i].azel[0]*R2D, chan[i].azel[1]*R2D, chan[i].rho0.d, chan[i].rho0.iono_delay, chan[i].rho0.tropo_delay);
 	}
 
 	////////////////////////////////////////////////////////////
@@ -2271,12 +3361,13 @@ int main(int argc, char *argv[])
 				// Refresh code phase and data bit counters
 				range_t rho;
 				sv = chan[i].prn-1;
+				seph = (chan[i].sys==SYS_GAL) ? &galcur[sv] : &eph[ieph][sv];
 
 				// Current pseudorange
 				if (!staticLocationMode)
-					computeRange(&rho, eph[ieph][sv], &ionoutc, grx, xyz[iumd]);
+					computeRange(&rho, *seph, &ionoutc, grx, xyz[iumd]);
 				else
-					computeRange(&rho, eph[ieph][sv], &ionoutc, grx, xyz[0]);
+					computeRange(&rho, *seph, &ionoutc, grx, xyz[0]);
 
 				chan[i].azel[0] = rho.azel[0];
 				chan[i].azel[1] = rho.azel[1];
@@ -2286,18 +3377,33 @@ int main(int argc, char *argv[])
 #ifndef FLOAT_CARR_PHASE
 				chan[i].carr_phasestep = (int)round(512.0 * 65536.0 * chan[i].f_carr * delt);
 #endif
-				// Path loss
-				path_loss = 20200000.0/rho.d;
-
 				// Receiver antenna gain
 				ibs = (int)((90.0-rho.azel[1]*R2D)/5.0); // covert elevation to boresight
 				ant_gain = ant_pat[ibs];
 
-				// Signal gain
-				if (path_loss_enable == TRUE)
-					gain[i] = (int)(path_loss * ant_gain * 128.0); // scaled by 2^7
+				if (chan[i].sys==SYS_GAL)
+				{
+					// Path loss, normalized to the Galileo orbit altitude
+					path_loss = 23222000.0/rho.d;
+
+					// Signal gain. The E1-B minus E1-C chip sum has twice the power of
+					// a C/A chip: GAL_E1_AMP sets E1 OS 1.25 dB above GPS C/A.
+					if (path_loss_enable == TRUE)
+						gain[i] = (int)(path_loss * ant_gain * 128.0 * GAL_E1_AMP); // scaled by 2^7
+					else
+						gain[i] = (int)(fixed_gain * GAL_E1_AMP); // hold the power level constant
+				}
 				else
-					gain[i] = fixed_gain; // hold the power level constant
+				{
+					// Path loss
+					path_loss = 20200000.0/rho.d;
+
+					// Signal gain
+					if (path_loss_enable == TRUE)
+						gain[i] = (int)(path_loss * ant_gain * 128.0); // scaled by 2^7
+					else
+						gain[i] = fixed_gain; // hold the power level constant
+				}
 			}
 		}
 
@@ -2315,44 +3421,76 @@ int main(int argc, char *argv[])
 #else
 					iTable = (chan[i].carr_phase >> 16) & 0x1ff; // 9-bit index
 #endif
-					ip = chan[i].dataBit * chan[i].codeCA * cosTable512[iTable] * gain[i];
-					qp = chan[i].dataBit * chan[i].codeCA * sinTable512[iTable] * gain[i];
-
-					// Accumulate for all visible satellites
-					i_acc += ip;
-					q_acc += qp;
-
-					// Update code phase
-					chan[i].code_phase += chan[i].f_code * delt;
-
-					if (chan[i].code_phase>=CA_SEQ_LEN)
+					if (chan[i].sys==SYS_GAL)
 					{
-						chan[i].code_phase -= CA_SEQ_LEN;
+						// Galileo E1 OS: (E1-B - E1-C) on a BOC(1,1) sub-carrier
+						int chip = (int)chan[i].code_phase;
+						int boc = ((int)(chan[i].code_phase*2.0) & 0x1) ? -1 : 1;
+						int e1 = (chan[i].dataBit*chan[i].ca[chip] - chan[i].secCode*chan[i].pilot[chip])*boc;
 
-						chan[i].icode++;
+						ip = e1 * cosTable512[iTable] * gain[i];
+						qp = e1 * sinTable512[iTable] * gain[i];
 
-						if (chan[i].icode>=20) // 20 C/A codes = 1 navigation data bit
+						// Accumulate for all visible satellites
+						i_acc += ip;
+						q_acc += qp;
+
+						// Update code phase
+						chan[i].code_phase += chan[i].f_code * delt;
+
+						if (chan[i].code_phase>=GAL_CODE_LEN)
 						{
-							chan[i].icode = 0;
-							chan[i].ibit++;
+							chan[i].code_phase -= GAL_CODE_LEN;
 
-							if (chan[i].ibit>=30) // 30 navigation data bits = 1 word
-							{
-								chan[i].ibit = 0;
-								chan[i].iword++;
-								/*
-								if (chan[i].iword>=N_DWRD)
-									fprintf(stderr, "\nWARNING: Subframe word buffer overflow.\n");
-								*/
-							}
+							// 1 primary code = 1 navigation symbol = 1 secondary code chip
+							if (chan[i].isym<GAL_SYM_BUF-1)
+								chan[i].isym++;
 
-							// Set new navigation data bit
-							chan[i].dataBit = (int)((chan[i].dwrd[chan[i].iword]>>(29-chan[i].ibit)) & 0x1UL)*2-1;
+							chan[i].dataBit = 1-2*chan[i].sym[chan[i].isym];
+							chan[i].secCode = 1-2*galCs25[chan[i].isym%GAL_SEC_CODE_LEN];
 						}
 					}
+					else
+					{
+						ip = chan[i].dataBit * chan[i].codeCA * cosTable512[iTable] * gain[i];
+						qp = chan[i].dataBit * chan[i].codeCA * sinTable512[iTable] * gain[i];
 
-					// Set current code chip
-					chan[i].codeCA = chan[i].ca[(int)chan[i].code_phase]*2-1;
+						// Accumulate for all visible satellites
+						i_acc += ip;
+						q_acc += qp;
+
+						// Update code phase
+						chan[i].code_phase += chan[i].f_code * delt;
+
+						if (chan[i].code_phase>=CA_SEQ_LEN)
+						{
+							chan[i].code_phase -= CA_SEQ_LEN;
+
+							chan[i].icode++;
+
+							if (chan[i].icode>=20) // 20 C/A codes = 1 navigation data bit
+							{
+								chan[i].icode = 0;
+								chan[i].ibit++;
+
+								if (chan[i].ibit>=30) // 30 navigation data bits = 1 word
+								{
+									chan[i].ibit = 0;
+									chan[i].iword++;
+									/*
+									if (chan[i].iword>=N_DWRD)
+										fprintf(stderr, "\nWARNING: Subframe word buffer overflow.\n");
+									*/
+								}
+
+								// Set new navigation data bit
+								chan[i].dataBit = (int)((chan[i].dwrd[chan[i].iword]>>(29-chan[i].ibit)) & 0x1UL)*2-1;
+							}
+						}
+
+						// Set current code chip
+						chan[i].codeCA = chan[i].ca[(int)chan[i].code_phase]*2-1;
+					}
 
 					// Update carrier phase
 #ifdef FLOAT_CARR_PHASE
@@ -2412,16 +3550,25 @@ int main(int argc, char *argv[])
 
 		if (igrx%300==0) // Every 30 seconds
 		{
+			// Select the Galileo ephemerides for the next sub-frame
+			if (sysmask & (1<<SYS_GAL))
+				selectGalEph(grx);
+
 			// Update navigation message
 			for (i=0; i<MAX_CHAN; i++)
 			{
 				if (chan[i].prn>0)
-					generateNavMsg(grx, &chan[i], 0);
+				{
+					if (chan[i].sys==SYS_GAL)
+						generateGalNavMsg(grx, &ionoutc, &chan[i]);
+					else
+						generateNavMsg(grx, &chan[i], 0);
+				}
 			}
 
 			// Refresh ephemeris and subframes
 			// Quick and dirty fix. Need more elegant way.
-			for (sv=0; sv<MAX_SAT; sv++)
+			for (sv=0; sv<MAX_SAT && ieph+1<neph; sv++)
 			{
 				if (eph[ieph+1][sv].vflg==1)
 				{
@@ -2433,7 +3580,7 @@ int main(int argc, char *argv[])
 						for (i=0; i<MAX_CHAN; i++)
 						{
 							// Generate new subframes if allocated
-							if (chan[i].prn!=0)
+							if (chan[i].prn!=0 && chan[i].sys==SYS_GPS)
 								eph2sbf(eph[ieph][chan[i].prn-1], ionoutc, chan[i].sbf);
 						}
 					}
@@ -2444,9 +3591,9 @@ int main(int argc, char *argv[])
 
 			// Update channel allocation
 			if (!staticLocationMode)
-				allocateChannel(chan, eph[ieph], ionoutc, grx, xyz[iumd], elvmask);
+				allocateChannel(chan, eph[ieph], ionoutc, grx, xyz[iumd], elvmask, sysmask);
 			else
-				allocateChannel(chan, eph[ieph], ionoutc, grx, xyz[0], elvmask);
+				allocateChannel(chan, eph[ieph], ionoutc, grx, xyz[0], elvmask, sysmask);
 
 			// Show details about simulated channels
 			if (verb==TRUE)
@@ -2455,8 +3602,8 @@ int main(int argc, char *argv[])
 				for (i=0; i<MAX_CHAN; i++)
 				{
 					if (chan[i].prn>0)
-						fprintf(stderr, "%02d %6.1f %5.1f %11.1f %5.1f\n", chan[i].prn,
-							chan[i].azel[0]*R2D, chan[i].azel[1]*R2D, chan[i].rho0.d, chan[i].rho0.iono_delay);
+						fprintf(stderr, "%c%02d %6.1f %5.1f %11.1f %5.1f %5.1f\n", (chan[i].sys==SYS_GAL)?'E':'G', chan[i].prn,
+							chan[i].azel[0]*R2D, chan[i].azel[1]*R2D, chan[i].rho0.d, chan[i].rho0.iono_delay, chan[i].rho0.tropo_delay);
 				}
 			}
 		}
