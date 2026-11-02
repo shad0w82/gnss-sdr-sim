@@ -2731,7 +2731,7 @@ int downloadRinexNav(gpstime_t g, int nday, char *navfile)
 
 void usage(void)
 {
-	fprintf(stderr, "Usage: gps-sdr-sim [options]\n"
+	fprintf(stderr, "Usage: gnss-sdr-sim [options]\n"
 		"Options:\n"
 		"  -e <gps_nav>     RINEX navigation file: RINEX 2 GPS, or RINEX 3 GPS/Galileo/mixed\n"
 		"  -D               Download the daily GPS/Galileo broadcast ephemerides of the scenario\n"

@@ -1,7 +1,7 @@
 # Makefile for Linux etc.
 
 .PHONY: all clean time
-all: gps-sdr-sim
+all: gnss-sdr-sim
 
 SHELL=/bin/bash
 CC=gcc
@@ -11,7 +11,7 @@ CFLAGS+=-DUSER_MOTION_SIZE=$(USER_MOTION_SIZE)
 endif
 LDFLAGS=-lm
 
-gps-sdr-sim: gpssim.o
+gnss-sdr-sim: gpssim.o
 	${CC} $< ${LDFLAGS} -o $@
 
 gpssim.o: .user-motion-size gpssim.h galcodes.h
@@ -27,12 +27,12 @@ gpssim.o: .user-motion-size gpssim.h galcodes.h
 	fi;
 
 clean:
-	rm -f gpssim.o gps-sdr-sim *.bin .user-motion-size
+	rm -f gpssim.o gnss-sdr-sim *.bin .user-motion-size
 
-time: gps-sdr-sim
-	time ./gps-sdr-sim -e brdc3540.14n -u circle.csv -b 1
-	time ./gps-sdr-sim -e brdc3540.14n -u circle.csv -b 8
-	time ./gps-sdr-sim -e brdc3540.14n -u circle.csv -b 16
+time: gnss-sdr-sim
+	time ./gnss-sdr-sim -e brdc3540.14n -u circle.csv -b 1
+	time ./gnss-sdr-sim -e brdc3540.14n -u circle.csv -b 8
+	time ./gnss-sdr-sim -e brdc3540.14n -u circle.csv -b 16
 
 .FORCE:
 

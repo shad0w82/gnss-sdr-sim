@@ -1,10 +1,13 @@
-# GPS-SDR-SIM
+# GNSS-SDR-SIM
 
-GPS-SDR-SIM generates GPS L1 C/A and Galileo E1 OS baseband signal data streams, which can be converted 
+GNSS-SDR-SIM generates GPS L1 C/A and Galileo E1 OS baseband signal data streams, which can be converted 
 to RF using software-defined radio (SDR) platforms, such as 
 [ADALM-Pluto](https://wiki.analog.com/university/tools/pluto), [bladeRF](http://nuand.com/), [HackRF](https://github.com/mossmann/hackrf/wiki), and [USRP](http://www.ettus.com/).
 Both constellations share the 1575.42 MHz carrier, so a single output file carries GPS and Galileo
 (see [Galileo E1](#galileo-e1)).
+
+GNSS-SDR-SIM is derived from [GPS-SDR-SIM](https://github.com/osqzss/gps-sdr-sim) by Takuji Ebinuma,
+which it extends with Galileo, RINEX 3 input, tropospheric delay and ephemeris download.
 
 A user guide in Italian, with examples for every SDR front-end, is in [docs/GUIDA.md](docs/GUIDA.md).
 
@@ -19,7 +22,7 @@ A user guide in Italian, with examples for every SDR front-end, is in [docs/GUID
 ### Building with GCC
 
 ```
-$ gcc gpssim.c -lm -O3 -o gps-sdr-sim
+$ gcc gpssim.c -lm -O3 -o gnss-sdr-sim
 ```
 
 ### Using bigger user motion files
@@ -35,7 +38,7 @@ $ make USER_MOTION_SIZE=4000
 This variable can also be set when compiling directly with GCC:
 
 ```
-$ gcc gpssim.c -lm -O3 -o gps-sdr-sim -DUSER_MOTION_SIZE=4000
+$ gcc gpssim.c -lm -O3 -o gnss-sdr-sim -DUSER_MOTION_SIZE=4000
 ```
 
 ### Generating the GPS signal file
@@ -56,7 +59,7 @@ Doppler for the GPS satellites in view. This simulated range data is
 then used to generate the digitized I/Q samples for the GPS signal.
 
 The bladeRF and ADALM-Pluto command line interface requires I/Q pairs stored as signed 
-16-bit integers, while the hackrf_transfer and gps-sdr-sim-uhd.py
+16-bit integers, while the hackrf_transfer and gnss-sdr-sim-uhd.py
 support signed bytes.
 
 HackRF, bladeRF and ADALM-Pluto can accept the default sample rate of 2.6MHz, 
@@ -71,11 +74,11 @@ prevent the output file from getting too large.
 
 The output file size can be reduced by using "-b 1" option to store 
 four 1-bit I/Q samples into a single byte. 
-You can use [bladeplayer](https://github.com/osqzss/gps-sdr-sim/tree/master/player)
+You can use [bladeplayer](player/)
 for bladeRF to playback the compressed file.
 
 ```
-Usage: gps-sdr-sim [options]
+Usage: gnss-sdr-sim [options]
 Options:
   -e <gps_nav>     RINEX navigation file: RINEX 2 GPS, or RINEX 3 GPS/Galileo/mixed
   -D               Download the daily GPS/Galileo broadcast ephemerides of the scenario
@@ -103,19 +106,19 @@ Options:
 The user motion can be specified in either dynamic or static mode:
 
 ```
-> gps-sdr-sim -e brdc3540.14n -u circle.csv
+> gnss-sdr-sim -e brdc3540.14n -u circle.csv
 ```
 
 ```
-> gps-sdr-sim -e brdc3540.14n -x circle_llh.csv
+> gnss-sdr-sim -e brdc3540.14n -x circle_llh.csv
 ```
 
 ```
-> gps-sdr-sim -e brdc3540.14n -g triumphv3.txt
+> gnss-sdr-sim -e brdc3540.14n -g triumphv3.txt
 ```
 
 ```
-> gps-sdr-sim -e brdc3540.14n -l 30.286502,120.032669,100
+> gnss-sdr-sim -e brdc3540.14n -l 30.286502,120.032669,100
 ```
 
 ### Galileo E1
@@ -127,9 +130,9 @@ ephemerides, such as the daily merged broadcast file `BRDC00IGS_R_YYYYDDD0000_01
 when both are present; `-C` selects the constellations:
 
 ```
-> gps-sdr-sim -e BRDC00IGS_R_20263000000_01D_MN.rnx -l 45.07,7.66,250 -t 2026/10/27,10:00:00
-> gps-sdr-sim -e BRDC00IGS_R_20263000000_01D_MN.rnx -C E -l 45.07,7.66,250
-> gps-sdr-sim -e BRDC00IGS_R_20263000000_01D_MN.rnx -C G -l 45.07,7.66,250
+> gnss-sdr-sim -e BRDC00IGS_R_20263000000_01D_MN.rnx -l 45.07,7.66,250 -t 2026/10/27,10:00:00
+> gnss-sdr-sim -e BRDC00IGS_R_20263000000_01D_MN.rnx -C E -l 45.07,7.66,250
+> gnss-sdr-sim -e BRDC00IGS_R_20263000000_01D_MN.rnx -C G -l 45.07,7.66,250
 ```
 
 RINEX 2 GPS files keep working as before, and GPS output is unchanged.
@@ -142,9 +145,9 @@ directory, using the `curl` and `gzip` commands (on Windows, `curl` is built in 
 for instance with Git for Windows):
 
 ```
-> gps-sdr-sim -D -l 45.07,7.66,250 -t 2026/10/30,10:00:00   # file of 2026/10/30
-> gps-sdr-sim -D -l 45.07,7.66,250 -T now                   # recent file, shifted to now
-> gps-sdr-sim -D -l 45.07,7.66,250                          # file of today
+> gnss-sdr-sim -D -l 45.07,7.66,250 -t 2026/10/30,10:00:00   # file of 2026/10/30
+> gnss-sdr-sim -D -l 45.07,7.66,250 -T now                   # recent file, shifted to now
+> gnss-sdr-sim -D -l 45.07,7.66,250                          # file of today
 ```
 
 * The date is the one of `-t` or `-T`, or today. With `-T` or without a date, the file of the
@@ -215,7 +218,7 @@ You can also execute these commands via the `bladeRF-cli` script option as below
 
 The output data have to be 8-bit signed I/Q samples.
 ```
-> gps-sdr-sim -e brdc0010.22n -b 8
+> gnss-sdr-sim -e brdc0010.22n -b 8
 ```
 You can use `hackrf_transfer` tool in the HackRF host software. 
 
@@ -226,7 +229,7 @@ You can use `hackrf_transfer` tool in the HackRF host software.
 #### UHD supported devices (tested with USRP2 only):
 
 ```
-> gps-sdr-sim-uhd.py -t gpssim.bin -s 2500000 -x 0
+> gnss-sdr-sim-uhd.py -t gpssim.bin -s 2500000 -x 0
 ```
 
 You can also use `tx_samples_from_file` tool included in the UHD examples:

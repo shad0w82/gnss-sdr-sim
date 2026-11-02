@@ -1,6 +1,6 @@
 # NMEA2UM
 
-NMEA2UM generates the ECEF user motion file for GPS-SDR-SIM from
+NMEA2UM generates the ECEF user motion file for GNSS-SDR-SIM from
 NMEA GGA data simulated by the free GPS NMEA simulation software
 from LabSat:
 

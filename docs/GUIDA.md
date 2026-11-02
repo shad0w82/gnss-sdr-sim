@@ -1,6 +1,6 @@
-# Guida all'uso di gps-sdr-sim (GPS + Galileo)
+# Guida all'uso di gnss-sdr-sim (GPS + Galileo)
 
-Questa guida spiega come generare un segnale GPS L1 C/A e Galileo E1 con `gps-sdr-sim` e come
+Questa guida spiega come generare un segnale GPS L1 C/A e Galileo E1 con `gnss-sdr-sim` e come
 trasmetterlo a un ricevitore GNSS con un front-end SDR (HackRF, bladeRF, ADALM-Pluto, LimeSDR,
 USRP).
 
@@ -20,7 +20,7 @@ USRP).
 
 ## 1. Come funziona
 
-`gps-sdr-sim` lavora in due passi:
+`gnss-sdr-sim` lavora in due passi:
 
 1. **Genera un file** di campioni I/Q in banda base. Per ogni satellite visibile dalla posizione
    scelta calcola distanza, Doppler, ritardi atmosferici, codice di spreading e messaggio di
@@ -30,7 +30,7 @@ USRP).
 
 ```
  RINEX (effemeridi) ─┐
- posizione/traiettoria ─┼─> gps-sdr-sim ──> gpssim.bin ──> player SDR ──> attenuatore ──> ricevitore
+ posizione/traiettoria ─┼─> gnss-sdr-sim ──> gpssim.bin ──> player SDR ──> attenuatore ──> ricevitore
  ora di inizio ───────┘
 ```
 
@@ -61,7 +61,7 @@ make
 oppure
 
 ```bash
-gcc gpssim.c -lm -O3 -o gps-sdr-sim
+gcc gpssim.c -lm -O3 -o gnss-sdr-sim
 ```
 
 Su Windows si compila con Visual Studio aggiungendo al progetto `gpssim.c` e `getopt.c`
@@ -79,7 +79,7 @@ parte, per esempio con Git for Windows.
 | bladeRF | `bladeRF-cli` (pacchetto `bladeRF`), oppure `player/bladeplayer` | 16 bit (default) o 1 bit |
 | ADALM-Pluto | `player/plutoplayer` (libiio, libad9361) | 16 bit (default) |
 | LimeSDR | `player/limeplayer` (LimeSuite) | 1, 8 o 16 bit |
-| USRP (UHD) | `gps-sdr-sim-uhd.py` (GNU Radio) o `tx_samples_from_file` (esempi UHD) | 8 o 16 bit |
+| USRP (UHD) | `gnss-sdr-sim-uhd.py` (GNU Radio) o `tx_samples_from_file` (esempi UHD) | 8 o 16 bit |
 
 I player della cartella `player/` si compilano con `make <nome>` dentro `player/`, dopo aver
 installato la libreria del dispositivo (istruzioni in `player/README.md`).
@@ -100,9 +100,9 @@ Con `-D` il simulatore scarica da solo il file del giorno dello scenario dall'ar
 BKG (nessuna registrazione) e lo salva nella cartella corrente:
 
 ```bash
-./gps-sdr-sim -D -l 45.07,7.66,250 -t 2026/10/30,10:00:00   # file del 30 ottobre 2026
-./gps-sdr-sim -D -l 45.07,7.66,250 -T now                   # effemeridi recenti, spostate all'ora attuale
-./gps-sdr-sim -D -l 45.07,7.66,250                          # file di oggi
+./gnss-sdr-sim -D -l 45.07,7.66,250 -t 2026/10/30,10:00:00   # file del 30 ottobre 2026
+./gnss-sdr-sim -D -l 45.07,7.66,250 -T now                   # effemeridi recenti, spostate all'ora attuale
+./gnss-sdr-sim -D -l 45.07,7.66,250                          # file di oggi
 ```
 
 - **Giorni passati:** scarica il file definitivo `BRDC00IGS_R_...` e lo riusa agli avvii successivi.
@@ -120,7 +120,7 @@ BKG (nessuna registrazione) e lo salva nella cartella corrente:
   `brdc0010.22n` come esempio.
 
 ```bash
-./gps-sdr-sim -e BRDC00IGS_R_20263000000_01D_MN.rnx -l 45.07,7.66,250 -t 2026/10/27,10:00:00
+./gnss-sdr-sim -e BRDC00IGS_R_20263000000_01D_MN.rnx -l 45.07,7.66,250 -t 2026/10/27,10:00:00
 ```
 
 ### Ora di inizio
@@ -139,25 +139,25 @@ BKG (nessuna registrazione) e lo salva nella cartella corrente:
 Posizione statica a Torino, GPS + Galileo, 5 minuti, con ritardo troposferico:
 
 ```bash
-./gps-sdr-sim -D -T now -l 45.07,7.66,250 -d 300 -a -o gpssim.bin
+./gnss-sdr-sim -D -T now -l 45.07,7.66,250 -d 300 -a -o gpssim.bin
 ```
 
 Lo stesso, ma per HackRF (8 bit):
 
 ```bash
-./gps-sdr-sim -D -T now -l 45.07,7.66,250 -d 300 -a -b 8 -o gpssim.bin
+./gnss-sdr-sim -D -T now -l 45.07,7.66,250 -d 300 -a -b 8 -o gpssim.bin
 ```
 
 Solo GPS a 2,6 MHz, per i player a frequenza fissa:
 
 ```bash
-./gps-sdr-sim -D -T now -C G -l 45.07,7.66,250 -d 300 -a -o gpssim.bin
+./gnss-sdr-sim -D -T now -C G -l 45.07,7.66,250 -d 300 -a -o gpssim.bin
 ```
 
 Solo Galileo:
 
 ```bash
-./gps-sdr-sim -D -T now -C E -l 45.07,7.66,250 -d 300 -a -o gpssim.bin
+./gnss-sdr-sim -D -T now -C E -l 45.07,7.66,250 -d 300 -a -o gpssim.bin
 ```
 
 ### Traiettorie (modalità dinamica)
@@ -165,9 +165,9 @@ Solo Galileo:
 Le traiettorie sono campionate a 10 Hz. Nel repo ci sono file di esempio:
 
 ```bash
-./gps-sdr-sim -e brdc0010.22n -u circle.csv -b 8          # ECEF x,y,z (con tempo in prima colonna)
-./gps-sdr-sim -e brdc0010.22n -x circle_llh.csv -b 8      # lat,lon,altezza
-./gps-sdr-sim -e brdc0010.22n -g triumphv3.txt -b 8       # stream NMEA GGA
+./gnss-sdr-sim -e brdc0010.22n -u circle.csv -b 8          # ECEF x,y,z (con tempo in prima colonna)
+./gnss-sdr-sim -e brdc0010.22n -x circle_llh.csv -b 8      # lat,lon,altezza
+./gnss-sdr-sim -e brdc0010.22n -g triumphv3.txt -b 8       # stream NMEA GGA
 ```
 
 La durata massima in modalità dinamica è 300 s. Per traiettorie più lunghe ricompila indicando la
@@ -209,7 +209,7 @@ valore passato con `-s`. Se non coincidono, il ricevitore non aggancia nessun sa
 File a 8 bit:
 
 ```bash
-./gps-sdr-sim -D -T now -l 45.07,7.66,250 -d 300 -a -b 8
+./gnss-sdr-sim -D -T now -l 45.07,7.66,250 -d 300 -a -b 8
 ```
 
 Trasmissione con `hackrf_transfer`, a 5 MHz:
@@ -239,7 +239,7 @@ alcuni falliscono. Per risultati affidabili usa un TCXO o un riferimento esterno
 File a 16 bit (default):
 
 ```bash
-./gps-sdr-sim -D -T now -l 45.07,7.66,250 -d 300 -a
+./gnss-sdr-sim -D -T now -l 45.07,7.66,250 -d 300 -a
 ```
 
 Script per `bladeRF-cli` (bladeRF prima generazione, x40/x115), da salvare come
@@ -295,7 +295,7 @@ tx wait
 `plutoplayer` trasmette file a 16 bit a 2,6 MHz fissi, quindi il file va generato a 2,6 MHz:
 
 ```bash
-./gps-sdr-sim -D -T now -l 45.07,7.66,250 -d 300 -a -s 2600000
+./gnss-sdr-sim -D -T now -l 45.07,7.66,250 -d 300 -a -s 2600000
 ```
 
 Il simulatore avvisa che sotto 4 MHz lo spettro di Galileo viene troncato; per il solo GPS
@@ -314,7 +314,7 @@ aggiungi `-C G` e l'avviso sparisce.
 `limeplayer` legge lo stream da stdin e accetta qualsiasi frequenza di campionamento:
 
 ```bash
-./gps-sdr-sim -D -T now -l 45.07,7.66,250 -d 300 -a
+./gnss-sdr-sim -D -T now -l 45.07,7.66,250 -d 300 -a
 ./limeplayer -s 5000000 -b 16 -g 0.1 < gpssim.bin
 ```
 
@@ -327,8 +327,8 @@ aggiungi `-C G` e l'avviso sparisce.
 Con lo script GNU Radio del repo, che ripete il file a ciclo continuo:
 
 ```bash
-./gps-sdr-sim -D -T now -l 45.07,7.66,250 -d 300 -a
-./gps-sdr-sim-uhd.py -t gpssim.bin -s 5000000 -b 16 -x 0
+./gnss-sdr-sim -D -T now -l 45.07,7.66,250 -d 300 -a
+./gnss-sdr-sim-uhd.py -t gpssim.bin -s 5000000 -b 16 -x 0
 ```
 
 - `-b 8` per file generati con `-b 8`; `-x` è il guadagno TX; `-c external` usa un riferimento
@@ -349,11 +349,11 @@ veloce del tempo reale: su un portatile recente con circa 25 satelliti a 5 MHz l
 volte, ma su macchine più lente il player resta senza campioni e il segnale si interrompe.
 
 ```bash
-./gps-sdr-sim -D -T now -l 45.07,7.66,250 -d 3600 -a -b 8 -o - | hackrf_transfer -t - -f 1575420000 -s 5000000 -a 1 -x 0
+./gnss-sdr-sim -D -T now -l 45.07,7.66,250 -d 3600 -a -b 8 -o - | hackrf_transfer -t - -f 1575420000 -s 5000000 -a 1 -x 0
 ```
 
 ```bash
-./gps-sdr-sim -D -T now -l 45.07,7.66,250 -d 3600 -a -o - | ./limeplayer -s 5000000 -b 16 -g 0.1
+./gnss-sdr-sim -D -T now -l 45.07,7.66,250 -d 3600 -a -o - | ./limeplayer -s 5000000 -b 16 -g 0.1
 ```
 
 Il simulatore stampa i suoi messaggi su stderr, quindi non si mescolano ai campioni.
