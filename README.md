@@ -6,6 +6,8 @@ to RF using software-defined radio (SDR) platforms, such as
 Both constellations share the 1575.42 MHz carrier, so a single output file carries GPS and Galileo
 (see [Galileo E1](#galileo-e1)).
 
+A user guide in Italian, with examples for every SDR front-end, is in [docs/GUIDA.md](docs/GUIDA.md).
+
 ### Windows build instructions
 
 1. Start Visual Studio.
