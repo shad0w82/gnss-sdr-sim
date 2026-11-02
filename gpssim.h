@@ -69,6 +69,12 @@
  *  (E1-B + E1-C at -157.25 dBW vs. C/A at -158.5 dBW) */
 #define GAL_E1_AMP (0.8167)
 
+/*! \brief Minimum sampling frequency holding the BOC(6,1) main lobes of the E1 CBOC (2 x 7 x 1.023 MHz) */
+#define GAL_CBOC_MIN_FS (14.322e6)
+
+/*! \brief Code phase bins per chip of the sampled E1 CBOC waveform */
+#define GAL_CBOC_NB (2048)
+
 #define SECONDS_IN_WEEK 604800.0
 #define SECONDS_IN_HALF_WEEK 302400.0
 #define SECONDS_IN_DAY 86400.0

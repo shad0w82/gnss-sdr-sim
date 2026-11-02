@@ -86,7 +86,8 @@ Options:
   -d <duration>    Duration [sec] (dynamic mode default: whole motion file,
                    static mode default: 300, max: 86400)
   -o <output>      I/Q sampling data file (default: gpssim.bin ; use - for stdout)
-  -s <frequency>   Sampling frequency [Hz] (default: 2600000, 5000000 with Galileo)
+  -s <frequency>   Sampling frequency [Hz] (default: 2600000, 5000000 with Galileo,
+                   15000000 or more for the full Galileo CBOC)
   -b <iq_bits>     I/Q data format [1/8/16] (default: 16)
   -i               Disable ionospheric delay for spacecraft scenario
   -a               Add tropospheric delay (Saastamoinen, standard atmosphere)
@@ -151,8 +152,30 @@ for instance with Git for Windows):
 The simulated Galileo signal is:
 
 * E1-B (data, I/NAV message) and E1-C (pilot, CS25 secondary code) with the primary codes of the
-  Galileo OS SIS ICD (`galcodes.h`), on a BOC(1,1) sub-carrier. The BOC(6,1) part of CBOC, which
-  carries 1/11 of the power, is not generated; receivers designed for CBOC track it with a small loss.
+  Galileo OS SIS ICD (`galcodes.h`), with the CBOC(6,1,1/11) modulation: BOC(1,1) and BOC(6,1)
+  sub-carriers weighted sqrt(10/11) and sqrt(1/11), in phase on E1-B and in antiphase on E1-C.
+  Each sample is the mean of the CBOC waveform over the sample duration: point sampling would
+  alias the sub-carrier harmonics into the band (at 15 MHz a BOC(6,1) transition comes every 1.2
+  samples), which distorts the code tracking of CBOC receivers. The mean attenuates the BOC(6,1)
+  lobes by sinc(6.138 MHz/fs): -2.5 dB at 15 MHz, -1.4 dB at 20 MHz, -0.6 dB at 30 MHz on a
+  component that carries 1/11 of the power.
+* The BOC(6,1) main lobes reach 7.161 MHz, so the full CBOC needs a sampling frequency of at least
+  14.322 MHz (`-s 15000000`). At lower sampling frequencies the BOC(6,1) component, 1/11 of the
+  power, is left out, as a front-end of that bandwidth would filter it out, and the simulator says
+  so. Receivers with a narrow front-end (about 4 MHz, most mass-market chips) see the same signal
+  in both cases; wideband receivers that track the BOC(6,1) part need `-s 15000000`, or 20-30 MHz
+  where the front-end and the storage allow it.
+* Galileo satellites keep Galileo System Time (GST). The GST-GPS offset (GGTO) of the RINEX header
+  (`GAGP`), ΔtSystems = t_GST − t_GPS = A0G + A1G·(t − t0G + 604800·(WN − WN0G)), is applied to the
+  signals: orbits and clock corrections are evaluated at the GST of transmission, and the code phase
+  and the I/NAV message carry GST time tags, offset from GPS time by GGTO, while the receiver time
+  stays GPS time. The same GGTO is broadcast in I/NAV word type 10, so a GPS+Galileo receiver either
+  applies it or estimates the inter-system offset, as with the real sky. Without a `GAGP` line GST
+  equals GPS time.
+* Code Doppler is simulated for both GPS and Galileo, not only the carrier shift: the chip rate is
+  1.023 MHz × (1 + f_D / 1575.42 MHz), and the code phase is recomputed from the pseudorange every
+  0.1 s, so code and carrier stay coherent over the whole run. The Galileo sub-carriers are locked to
+  the code phase and follow the same Doppler.
 * I/NAV nominal pages on E1-B, with FEC encoding, interleaving, CRC-24Q and secondary synchronisation
   patterns. Word types 1 to 6 carry the ephemeris, clock, ionospheric, BGD, health, GST and GST-UTC
   data of the RINEX file, word types 7 to 10 an almanac derived from the ephemerides and the GST-GPS
@@ -162,14 +185,38 @@ The simulated Galileo signal is:
 
 Limitations:
 
-* Galileo System Time is assumed equal to GPS time; the GST-GPS offset of the RINEX file is only
-  broadcast.
 * The ionospheric delay of every satellite follows the GPS Klobuchar model. A Galileo-only receiver
   applying NeQuick sees a residual error of a few meters.
 * The BOC(1,1) spectrum needs a sampling frequency of at least 4 MHz, so the default becomes 5 MHz
-  when Galileo is simulated. `bladeplayer`, `hackplayer` and `plutoplayer` replay at a fixed 2.6 MHz:
+  when Galileo is simulated (full CBOC: `-s 15000000`). `bladeplayer`, `hackplayer` and `plutoplayer` replay at a fixed 2.6 MHz:
   use them with `-s 2600000`, or replay 5 MHz files with `hackrf_transfer -s 5000000`,
   `bladeRF-cli` (`set samplerate 5M`) or `limeplayer -s 5000000`.
+* At 15 MHz the generation is slower than real time (about 43 s for 34 s of signal on an Apple
+  M1 Pro, against 14 s at 5 MHz), and files take 30 MB/s with 8-bit samples or 60 MB/s with
+  16-bit samples: generate the file first, then replay it.
+
+#### Validation
+
+The Galileo signal was checked with an independent software receiver (acquisition, code and
+carrier tracking, I/NAV decoding, least-squares fix) on a static 34 s scenario in Torino, with the
+merged broadcast file of the IGS and the ionospheric and tropospheric corrections of the simulator
+applied:
+
+* all I/NAV pages of the 11 Galileo satellites pass the CRC-24Q check, at 5 and 15 MHz;
+* at 20 MHz the spectrum shows the BOC(6,1) lobes at ±6.1 MHz with 6.8% of the Galileo power, and
+  the correlation gain of a CBOC replica over a BOC(1,1) replica is the expected one (1.0092
+  measured, 1.0096 computed for the sample-averaged waveform);
+* GPS output is byte-identical to the original GPS-SDR-SIM (md5) on RINEX 2 scenarios.
+
+Mean 3D position error of the fixes:
+
+| Sampling frequency | GPS only | Galileo only | GPS + Galileo, GGTO applied | GPS + Galileo, GGTO ignored |
+|---|---|---|---|---|
+| 5 MHz (BOC(1,1) part of the CBOC) | 8.4 cm | 7.0 cm | 4.1 cm | 10.9 cm |
+| 15 MHz (full CBOC, CBOC replica) | | 4.1 cm | 2.2 cm | 8.5 cm |
+
+The GGTO of that day was −0.32 ns (about 10 cm): a receiver that ignores it sees the Galileo
+pseudoranges biased by that amount against GPS.
 
 ### Tropospheric delay
 

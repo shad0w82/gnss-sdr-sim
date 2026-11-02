@@ -37,6 +37,50 @@ USRP).
 Il file contiene solo il segnale: il simulatore non aggiunge rumore termico. Il rumore lo
 aggiungono l'SDR e il ricevitore.
 
+Alcuni dettagli del segnale:
+
+- **Doppler.** Il moto relativo tra satellite e ricevitore sposta sia la frequenza della portante
+  sia la velocità del codice: il chip rate diventa 1,023 MHz × (1 + f_D/1575,42 MHz). Ogni 0,1 s
+  la fase del codice viene ricalcolata dalla pseudodistanza, quindi codice e portante restano
+  coerenti per tutta la simulazione. Nel Galileo le sottoportanti sono agganciate al codice e
+  seguono lo stesso Doppler.
+- **Modulazione Galileo E1.** CBOC(6,1,1/11): sottoportanti BOC(1,1) e BOC(6,1) con pesi
+  √(10/11) e √(1/11), in fase su E1-B (dati) e in controfase su E1-C (pilota). I lobi della
+  BOC(6,1) arrivano a 7,16 MHz, quindi la CBOC completa richiede una frequenza di campionamento di
+  almeno 14,322 MHz (`-s 15000000`). Sotto questa soglia la componente BOC(6,1), che porta 1/11
+  della potenza, viene omessa, come farebbe un front-end di quella banda; il simulatore lo segnala
+  all'avvio. Per i ricevitori a banda stretta (circa 4 MHz, quasi tutti i chip commerciali) il
+  segnale è lo stesso nei due casi.
+  Ogni campione è la media della forma d'onda CBOC sulla durata del campione: il campionamento
+  puntuale porterebbe in banda le armoniche delle sottoportanti (a 15 MHz una transizione della
+  BOC(6,1) cade ogni 1,2 campioni) e disturberebbe il tracking dei ricevitori CBOC. La media
+  attenua un po' la BOC(6,1): −2,5 dB a 15 MHz, −1,4 dB a 20 MHz, −0,6 dB a 30 MHz. Se SDR e disco
+  lo permettono, 20–30 MHz danno la CBOC più fedele.
+- **Tempo Galileo.** I satelliti Galileo seguono il Galileo System Time (GST), che differisce dal
+  tempo GPS di pochi nanosecondi. Il simulatore legge l'offset GST−GPS (GGTO) dalla riga `GAGP`
+  dell'header RINEX, ΔtSystems = A0G + A1G·(t − t0G + 604800·(WN − WN0G)), e lo applica al
+  segnale: orbite e orologi Galileo sono calcolati in GST, la fase del codice e il messaggio I/NAV
+  portano tempi GST, mentre il tempo del ricevitore resta il tempo GPS. Lo stesso GGTO è trasmesso
+  nella parola 10 dell'I/NAV: un ricevitore GPS+Galileo deve applicarlo, oppure stimare l'offset
+  tra i due sistemi, come con il cielo vero. Senza la riga `GAGP` GST e tempo GPS coincidono.
+
+Il segnale è stato verificato con un ricevitore software indipendente (acquisizione, tracking,
+decodifica I/NAV, soluzione ai minimi quadrati) su uno scenario statico di 34 s a Torino:
+
+- tutte le pagine I/NAV degli 11 satelliti Galileo hanno il CRC corretto, a 5 e a 15 MHz;
+- a 20 MHz lo spettro mostra i lobi della BOC(6,1) a ±6,1 MHz con il 6,8% della potenza Galileo;
+- l'uscita GPS è identica byte per byte a quella di GPS-SDR-SIM originale.
+
+Errore medio 3D della posizione:
+
+| Campionamento | Solo GPS | Solo Galileo | GPS + Galileo con GGTO | GPS + Galileo senza GGTO |
+|---|---|---|---|---|
+| 5 MHz (parte BOC(1,1) della CBOC) | 8,4 cm | 7,0 cm | 4,1 cm | 10,9 cm |
+| 15 MHz (CBOC completa, replica CBOC) | | 4,1 cm | 2,2 cm | 8,5 cm |
+
+Quel giorno il GGTO valeva −0,32 ns (circa 10 cm): un ricevitore che lo ignora vede le
+pseudodistanze Galileo spostate di tanto rispetto a quelle GPS.
+
 ## 2. Avvertenze
 
 - **Non trasmettere in aria.** Emettere segnali sulle frequenze GNSS è vietato dalla legge e
@@ -245,6 +289,8 @@ funziona offline se il percorso ha già le quote, oppure con `--height` o `--no-
 |---|---|---|
 | 5 MHz, 8 bit (HackRF) | 10 MB/s | circa 3 GB |
 | 5 MHz, 16 bit (bladeRF, Pluto, USRP) | 20 MB/s | circa 6 GB |
+| 15 MHz, 8 bit (HackRF, CBOC completa) | 30 MB/s | circa 9 GB |
+| 15 MHz, 16 bit (bladeRF, USRP, CBOC completa) | 60 MB/s | circa 18 GB |
 | 2,6 MHz, 8 bit | 5,2 MB/s | circa 1,6 GB |
 | 2,6 MHz, 1 bit (`-b 1`, solo bladeplayer e limeplayer) | 0,65 MB/s | circa 0,2 GB |
 
@@ -283,6 +329,7 @@ hackrf_transfer -t gpssim.bin -f 1575420000 -s 5000000 -a 1 -x 0
 - `-a 1` attiva l'amplificatore RF interno; `-x` è il guadagno TX in dB (0–47).
   Parti da `-x 0` e regola il livello con gli attenuatori (sezione 7).
 - Con un file a 2,6 MHz (solo GPS, o `-s 2600000`) usa `-s 2600000`.
+- Con un file a 15 MHz (CBOC completa, `-s 15000000 -b 8`) usa `-s 15000000`.
 - `hackrf_transfer` trasmette il file una volta; con `-R` lo ripete a ciclo continuo, ma
   il tempo dei satelliti ricomincia da capo a ogni ripetizione e il ricevitore perde il fix.
 - Con `player/hackplayer` (solo file a 2,6 MHz):
@@ -337,7 +384,7 @@ tx wait
 ```
 
 - Con un file a 2,6 MHz imposta `samplerate 2.6M` e `bandwidth 2.5M` (lo script `bladerf.script`
-  del repo fa così).
+  del repo fa così). Con un file a 15 MHz (CBOC completa) imposta `samplerate 15M` e `bandwidth 15M`.
 - Il guadagno (`txvga1` da −35 a −4 dB sulla prima generazione, `gain tx1` sulla 2.0) va regolato
   con gli attenuatori. Controlla l'intervallo valido sul tuo modello con `print gain`.
 - `tx config` trasmette il file una volta; `repeat=0` lo ripete senza fine, con lo stesso problema
@@ -407,8 +454,10 @@ tx_samples_from_file --file gpssim.bin --type short --rate 5000000 --freq 157542
 ### Generazione e trasmissione in contemporanea
 
 Con `-o -` il simulatore scrive su stdout, e il file non serve più. La generazione deve essere più
-veloce del tempo reale: su un portatile recente con circa 25 satelliti a 5 MHz lo è di circa tre
-volte, ma su macchine più lente il player resta senza campioni e il segnale si interrompe.
+veloce del tempo reale: su un portatile recente con circa 25 satelliti a 5 MHz lo è di circa due
+volte e mezzo, ma su macchine più lente il player resta senza campioni e il segnale si interrompe.
+A 15 MHz (CBOC completa) la generazione può essere più lenta del tempo reale: in quel caso genera
+prima il file e poi trasmettilo.
 
 ```bash
 ./gnss-sdr-sim -D -T now -l 45.07,7.66,250 -d 3600 -a -b 8 -o - | hackrf_transfer -t - -f 1575420000 -s 5000000 -a 1 -x 0
@@ -457,7 +506,7 @@ Il primo fix arriva quando il ricevitore ha decodificato effemeridi e tempo, di 
 | `-T <data,ora>` | Sposta le effemeridi all'ora indicata; `-T now` usa l'ora attuale |
 | `-d <s>` | Durata in secondi (statica: 300 di default, massimo 86400; dinamica: tutto il file della traiettoria) |
 | `-o <file>` | File di uscita (default `gpssim.bin`; `-` per stdout) |
-| `-s <Hz>` | Frequenza di campionamento (default 2600000, 5000000 con Galileo) |
+| `-s <Hz>` | Frequenza di campionamento (default 2600000, 5000000 con Galileo; 15000000 per la CBOC completa) |
 | `-b <bit>` | Formato I/Q: 1, 8 o 16 bit (default 16) |
 | `-a` | Aggiunge il ritardo troposferico (modello Saastamoinen) |
 | `-i` | Disattiva il ritardo ionosferico (scenari spaziali) |

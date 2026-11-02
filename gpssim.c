@@ -97,6 +97,8 @@ const int galCs25[GAL_SEC_CODE_LEN] = {
 };
 
 // Allocated channel per satellite: GPS PRN 1..32 at [0..31], Galileo SVID 1..36 at [32..67]
+float galCbocB[3][GAL_CBOC_NB],galCbocC[3][GAL_CBOC_NB]; // Sampled E1 CBOC waveform
+int galCbocEdge; // Bins at each chip edge where a sample reaches the neighbouring chip
 int allocatedSat[MAX_SAT+MAX_SAT_GAL];
 
 // User positions (ECEF) at 10 Hz, grown as the motion file is read
@@ -1769,6 +1771,100 @@ void computeRange(range_t *rho, ephem_t eph, ionoutc_t *ionoutc, gpstime_t g, do
 	return;
 }
 
+/*! \brief Tabulate the Galileo E1 OS CBOC(6,1,1/11) waveform as sampled
+ *  \param[in] w Sample duration in chips
+ *  \param[in] beta BOC(6,1) weight, sqrt(1/11) or 0 when the band cannot hold it
+ *
+ *  E1 = e_B*(alpha*sc_a + beta*sc_b) - e_C*(alpha*sc_a - beta*sc_b), with the sine-phased
+ *  BOC(1,1) sub-carrier sc_a and BOC(6,1) sub-carrier sc_b. A sample is the mean of this
+ *  waveform over the sample duration, centered on the code phase. Point sampling would
+ *  alias the sub-carrier harmonics into the band (the BOC(6,1) transitions come every
+ *  1.2 samples at 15 MHz), which distorts the code tracking of CBOC receivers. The box
+ *  average suppresses them, at the cost of attenuating the BOC(6,1) lobes by
+ *  sinc(6.138 MHz/fs). Centering keeps the code delay equal to the point-sampled GPS signal.
+ *  The waveform is piecewise constant on twelfths of a chip, so the mean is exact.
+ *  galCbocB[j][n] and galCbocC[j][n] hold the E1-B and E1-C weights of the previous (j=0),
+ *  current (1) and next (2) chip for a code phase in bin n of the current chip:
+ *  sample = sum_j (e_B*galCbocB[j][n] - e_C*galCbocC[j][n]).
+ */
+void galCbocTables(double w, double beta)
+{
+	const double alpha = sqrt(1.0 - beta*beta);
+	int n,j,k;
+
+	galCbocEdge = (int)ceil(0.5*w*GAL_CBOC_NB) + 1;
+
+	for (n=0; n<GAL_CBOC_NB; n++)
+	{
+		double x0 = ((double)n+0.5)/GAL_CBOC_NB - 0.5*w;
+		double x1 = x0 + w;
+
+		for (j=0; j<3; j++)
+		{
+			double a = 0.0, b = 0.0;
+
+			for (k=0; k<12; k++)
+			{
+				double s0 = (double)(j-1) + (double)k/12.0;
+				double s1 = s0 + 1.0/12.0;
+				double len = ((s1<x1)?s1:x1) - ((s0>x0)?s0:x0);
+
+				if (len>0.0)
+				{
+					a += ((k<6)?1.0:-1.0)*len; // BOC(1,1) sub-carrier
+					b += ((k&1)?-1.0:1.0)*len; // BOC(6,1) sub-carrier
+				}
+			}
+
+			galCbocB[j][n] = (float)((alpha*a + beta*b)/w);
+			galCbocC[j][n] = (float)((alpha*a - beta*b)/w);
+		}
+	}
+
+	return;
+}
+
+/*! \brief GST minus GPS time from the broadcast GGTO polynomial
+ *  \param[in] g GPS time
+ *  \returns Delta t_systems = t_GST - t_GPS in seconds
+ */
+double galGgto(gpstime_t g)
+{
+	double dt = g.sec - (double)galutc.t0g + (double)(g.week - galutc.wn0g)*SECONDS_IN_WEEK;
+
+	return galutc.A0G + galutc.A1G*dt;
+}
+
+/*! \brief Compute the range for a GPS or Galileo satellite
+ *  \param[out] rho The computed range
+ *  \param[in] eph Ephemeris data of the satellite
+ *  \param[in] sys Constellation of the satellite
+ *  \param[in] g GPS time at time of receiving the signal
+ *  \param[in] xyz position of the receiver
+ *
+ *  Galileo satellites keep GST, and their ephemerides and clock corrections refer
+ *  to GST. The orbit is evaluated at the GST of the reception, and the pseudorange
+ *  is shortened by c*(GST-GPST) so that the code phase carries GST time tags while
+ *  the receiver clock stays on GPS time.
+ */
+void computeRangeSys(range_t *rho, ephem_t eph, int sys, ionoutc_t *ionoutc, gpstime_t g, double xyz[])
+{
+	double ggto;
+
+	if (sys!=SYS_GAL)
+	{
+		computeRange(rho, eph, ionoutc, g, xyz);
+		return;
+	}
+
+	ggto = galGgto(g);
+	computeRange(rho, eph, ionoutc, incGpsTime(g, ggto), xyz);
+	rho->range -= SPEED_OF_LIGHT*ggto;
+	rho->g = g;
+
+	return;
+}
+
 /*! \brief Compute the code phase for a given channel (satellite)
  *  \param chan Channel on which we operate (is updated)
  *  \param[in] rho1 Current range, after \a dt has expired
@@ -2631,13 +2727,13 @@ int allocateChannel(channel_t *chan, ephem_t *eph, ionoutc_t ionoutc, gpstime_t 
 						}
 
 						// Initialize pseudorange
-						computeRange(&rho, *seph, &ionoutc, grx, xyz);
+						computeRangeSys(&rho, *seph, sys, &ionoutc, grx, xyz);
 						chan[i].rho0 = rho;
 
 						// Initialize carrier phase
 						r_xyz = rho.range;
 
-						computeRange(&rho, *seph, &ionoutc, grx, ref);
+						computeRangeSys(&rho, *seph, sys, &ionoutc, grx, ref);
 						r_ref = rho.range;
 
 						phase_ini = 0.0; // TODO: Must initialize properly
@@ -2776,7 +2872,8 @@ void usage(void)
 		"  -d <duration>    Duration [sec] (dynamic mode default: whole motion file,\n"
 		"                   static mode default: %.0f, max: %d)\n"
 		"  -o <output>      I/Q sampling data file (default: gpssim.bin)\n"
-		"  -s <frequency>   Sampling frequency [Hz] (default: 2600000, 5000000 with Galileo)\n"
+		"  -s <frequency>   Sampling frequency [Hz] (default: 2600000, 5000000 with Galileo,\n"
+		"                   15000000 or more for the full Galileo CBOC)\n"
 		"  -b <iq_bits>     I/Q data format [1/8/16] (default: 16)\n"
 		"  -i               Disable ionospheric delay for spacecraft scenario\n"
 		"  -a               Add tropospheric delay (Saastamoinen, standard atmosphere)\n"
@@ -3228,8 +3325,24 @@ int main(int argc, char *argv[])
 	if ((sysmask & (1<<SYS_GAL)) && samp_freq_set==FALSE)
 		samp_freq = 5.0e6; // Room for the BOC(1,1) main lobes of Galileo E1
 
-	if ((sysmask & (1<<SYS_GAL)) && samp_freq<4.0e6)
-		fprintf(stderr, "WARNING: Sampling frequency below 4 MHz truncates the Galileo E1 BOC(1,1) spectrum.\n");
+	if (sysmask & (1<<SYS_GAL))
+	{
+		if (samp_freq<4.0e6)
+			fprintf(stderr, "WARNING: Sampling frequency below 4 MHz truncates the Galileo E1 BOC(1,1) spectrum.\n");
+
+		// The BOC(6,1) main lobes reach 7.161 MHz: below that bandwidth they would alias
+		// into the band, so they are left out as a band-limiting front-end would do.
+		if (samp_freq>=GAL_CBOC_MIN_FS)
+		{
+			galCbocTables(CODE_FREQ/samp_freq, sqrt(1.0/11.0));
+			fprintf(stderr, "Galileo E1 modulation: CBOC(6,1,1/11).\n");
+		}
+		else
+		{
+			galCbocTables(CODE_FREQ/samp_freq, 0.0);
+			fprintf(stderr, "Galileo E1 modulation: CBOC(6,1,1/11) limited to %.1f MHz (BOC(6,1) component outside the band; use -s 15000000 or more for the full CBOC).\n", samp_freq/1.0e6);
+		}
+	}
 
 	samp_freq = floor(samp_freq/10.0);
 	iq_buff_size = (int)samp_freq; // samples per 0.1sec
@@ -3531,9 +3644,9 @@ int main(int argc, char *argv[])
 
 				// Current pseudorange
 				if (!staticLocationMode)
-					computeRange(&rho, *seph, &ionoutc, grx, xyz[iumd]);
+					computeRangeSys(&rho, *seph, chan[i].sys, &ionoutc, grx, xyz[iumd]);
 				else
-					computeRange(&rho, *seph, &ionoutc, grx, xyz[0]);
+					computeRangeSys(&rho, *seph, chan[i].sys, &ionoutc, grx, xyz[0]);
 
 				chan[i].azel[0] = rho.azel[0];
 				chan[i].azel[1] = rho.azel[1];
@@ -3589,13 +3702,26 @@ int main(int argc, char *argv[])
 #endif
 					if (chan[i].sys==SYS_GAL)
 					{
-						// Galileo E1 OS: (E1-B - E1-C) on a BOC(1,1) sub-carrier
+						// Galileo E1 OS: CBOC(6,1,1/11) of E1-B and E1-C
 						int chip = (int)chan[i].code_phase;
-						int boc = ((int)(chan[i].code_phase*2.0) & 0x1) ? -1 : 1;
-						int e1 = (chan[i].dataBit*chan[i].ca[chip] - chan[i].secCode*chan[i].pilot[chip])*boc;
+						int n = (int)((chan[i].code_phase - chip)*GAL_CBOC_NB);
+						float e1 = chan[i].dataBit*chan[i].ca[chip]*galCbocB[1][n] - chan[i].secCode*chan[i].pilot[chip]*galCbocC[1][n];
 
-						ip = e1 * cosTable512[iTable] * gain[i];
-						qp = e1 * sinTable512[iTable] * gain[i];
+						// Part of the sample in the neighbouring chips
+						if (n<galCbocEdge)
+						{
+							int c = (chip>0) ? chip-1 : GAL_CODE_LEN-1;
+							e1 += chan[i].dataBit*chan[i].ca[c]*galCbocB[0][n] - chan[i].secCode*chan[i].pilot[c]*galCbocC[0][n];
+						}
+
+						if (n>=GAL_CBOC_NB-galCbocEdge)
+						{
+							int c = (chip<GAL_CODE_LEN-1) ? chip+1 : 0;
+							e1 += chan[i].dataBit*chan[i].ca[c]*galCbocB[2][n] - chan[i].secCode*chan[i].pilot[c]*galCbocC[2][n];
+						}
+
+						ip = (int)(e1 * cosTable512[iTable] * gain[i]);
+						qp = (int)(e1 * sinTable512[iTable] * gain[i]);
 
 						// Accumulate for all visible satellites
 						i_acc += ip;
