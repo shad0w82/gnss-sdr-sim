@@ -170,12 +170,74 @@ Le traiettorie sono campionate a 10 Hz. Nel repo ci sono file di esempio:
 ./gnss-sdr-sim -e brdc0010.22n -g triumphv3.txt -b 8       # stream NMEA GGA
 ```
 
-La durata massima in modalità dinamica è 300 s. Per traiettorie più lunghe ricompila indicando la
-durata in secondi, per esempio:
+La simulazione dura quanto il file della traiettoria, senza limiti; con `-d` la si può accorciare.
+La quota dei file `-x` è **ellissoidica** (non sul livello del mare).
+
+### Disegnare la traiettoria su una mappa
+
+Nella cartella `tools` ci sono due strumenti che producono il file per `-x` (o `-u`) a partire da
+un percorso. Danno esattamente lo stesso risultato.
+
+**Pagina web `route_planner.html`.** Il browser non carica gli script della pagina da `file://`,
+quindi va servita via HTTP:
 
 ```bash
-make USER_MOTION_SIZE=4000
+python3 -m http.server 8000 --directory tools
 ```
+
+Poi apri http://localhost:8000/route_planner.html e:
+
+1. cerca il luogo per nome, oppure sposta la mappa;
+2. scegli il tracciato: linea retta, strade (auto), ciclabile o a piedi;
+3. clicca sulla mappa per aggiungere i punti; trascinali per spostarli; clicca su un punto per
+   impostare la velocità del tratto successivo o per cancellarlo;
+4. imposta movimento e quota (pannello a sinistra) e premi **Genera CSV**: la pagina mostra la
+   traiettoria (tratteggio rosa), il riepilogo e il profilo di velocità, e scarica `route.csv`;
+5. con **Salva GeoJSON** salvi il percorso per riaprirlo dopo (Importa) o per usarlo con lo script.
+
+La pagina importa anche file GPX, KML e GeoJSON, per esempio percorsi disegnati con
+[gpx.studio](https://gpx.studio) (che segue le strade e aggiunge le quote) o con Google My Maps
+(esporta in KML).
+
+**Script `route2motion.py`.** Fa la stessa conversione da riga di comando, utile per automatizzare
+i test. Richiede solo Python 3, senza librerie aggiuntive.
+
+```bash
+python3 tools/route2motion.py percorso.gpx -o percorso.csv --speed 50
+python3 tools/route2motion.py percorso.kml -o percorso.csv --speed 5 --height 250   # a piedi, quota fissa
+python3 tools/route2motion.py route.geojson -o route.csv                             # salvato dalla pagina
+python3 tools/route2motion.py percorso.gpx -o percorso.csv --duration 600            # dura 10 minuti
+```
+
+Poi:
+
+```bash
+./gnss-sdr-sim -D -T now -x percorso.csv -a -b 8
+```
+
+**Parametri principali** (uguali nella pagina e nello script):
+
+| Parametro | Default | Significato |
+|---|---|---|
+| Velocità (`--speed`) | 50 km/h | Velocità di crociera; nella pagina anche per singolo tratto |
+| Accelerazione (`--accel`) | 1,5 m/s² | Accelerazione e frenata massime |
+| Accel. laterale (`--lat-accel`) | 2 m/s² | Limita la velocità in curva (valore indicativo, entro circa il 15%) |
+| Arrotondamento (`--smooth`) | 20 m | Gli angoli del percorso diventano curve di questa dimensione |
+| Sosta iniziale (`--hold-start`) | 60 s | Fermo all'inizio: dà tempo al ricevitore di fare il primo fix |
+| Sosta finale (`--hold-end`) | 10 s | Fermo alla fine |
+| Quota | terreno | Dal file del percorso, costante (`--height`) o dal modello del terreno |
+| Antenna (`--agl`) | 0 m | Altezza dell'antenna sopra il suolo, per esempio 1,5 m su un'auto |
+
+**Come funziona.** Il percorso viene ricampionato ogni metro e smussato, così gli angoli diventano
+curve. La velocità viene limitata in curva e da accelerazione e frenata, e la traiettoria viene
+campionata a 10 Hz. Le quote del terreno (Copernicus DEM, servizio Open-Meteo) e quelle dei file
+GPX/KML sono sul livello del mare: gli strumenti le convertono in quote ellissoidiche con il geoide
+EGM96 (in Italia la differenza è di circa 40–50 m).
+
+**Servizi esterni.** Routing (server dimostrativi OSRM), ricerca dei luoghi (Nominatim) e quote del
+terreno (Open-Meteo) sono servizi pubblici gratuiti con limiti d'uso: vanno bene per disegnare
+percorsi, non per migliaia di richieste. Senza internet la pagina non mostra la mappa; lo script
+funziona offline se il percorso ha già le quote, oppure con `--height` o `--no-dem`.
 
 ### Quanto è grande il file
 
@@ -389,11 +451,11 @@ Il primo fix arriva quando il ricevitore ha decodificato effemeridi e tempo, di 
 | `-l lat,lon,h` | Posizione statica in gradi e metri, per esempio `45.07,7.66,250` |
 | `-c x,y,z` | Posizione statica ECEF in metri |
 | `-u <file>` | Traiettoria ECEF a 10 Hz (CSV) |
-| `-x <file>` | Traiettoria lat, lon, altezza a 10 Hz (CSV) |
+| `-x <file>` | Traiettoria lat, lon, quota ellissoidica a 10 Hz (CSV), per esempio da `tools/route2motion.py` |
 | `-g <file>` | Traiettoria da stream NMEA GGA |
 | `-t <data,ora>` | Ora di inizio `AAAA/MM/GG,hh:mm:ss`, dentro l'intervallo del file |
 | `-T <data,ora>` | Sposta le effemeridi all'ora indicata; `-T now` usa l'ora attuale |
-| `-d <s>` | Durata in secondi (statica: massimo 86400; dinamica: 300 di default) |
+| `-d <s>` | Durata in secondi (statica: 300 di default, massimo 86400; dinamica: tutto il file della traiettoria) |
 | `-o <file>` | File di uscita (default `gpssim.bin`; `-` per stdout) |
 | `-s <Hz>` | Frequenza di campionamento (default 2600000, 5000000 con Galileo) |
 | `-b <bit>` | Formato I/Q: 1, 8 o 16 bit (default 16) |

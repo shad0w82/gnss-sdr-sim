@@ -1,0 +1,595 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Route Planner – gnss-sdr-sim</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script src="geoid_egm96.js"></script>
+<script src="route_core.js"></script>
+<style>
+	:root {
+		--bg: #f6f7f9; --panel: #ffffff; --text: #1d232b; --muted: #5f6b7a; --border: #d8dde3;
+		--accent: #1f6feb; --accent-text: #ffffff; --route: #1f6feb; --traj: #d6336c; --warn: #b54708;
+	}
+	@media (prefers-color-scheme: dark) {
+		:root {
+			--bg: #12161b; --panel: #1b2027; --text: #e6e9ed; --muted: #9aa5b1; --border: #2f3640;
+			--accent: #4c8dff; --accent-text: #0b0e12; --route: #4c8dff; --traj: #ff6b9a; --warn: #f5a524;
+		}
+	}
+	* { box-sizing: border-box; }
+	html, body { height: 100%; margin: 0; }
+	body { background: var(--bg); color: var(--text); font: 14px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; display: flex; }
+	#side { width: 340px; flex: none; height: 100%; overflow-y: auto; background: var(--panel); border-right: 1px solid var(--border); padding: 14px 16px 24px; }
+	#map { flex: 1; height: 100%; }
+	h1 { font-size: 17px; margin: 0 0 2px; }
+	.sub { color: var(--muted); font-size: 12px; margin-bottom: 12px; }
+	h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 18px 0 8px; }
+	label { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin: 6px 0; }
+	label span.u { color: var(--muted); font-size: 12px; }
+	input[type=number] { width: 84px; }
+	input, select, button { font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 5px 7px; }
+	button { cursor: pointer; }
+	button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); font-weight: 600; }
+	button:disabled { opacity: .5; cursor: default; }
+	.row { display: flex; gap: 6px; flex-wrap: wrap; }
+	.row > * { flex: 1; }
+	#search { display: flex; gap: 6px; }
+	#search input { flex: 1; min-width: 0; }
+	#status { margin-top: 10px; font-size: 13px; min-height: 18px; }
+	#status.err { color: var(--warn); }
+	#summary { font-size: 13px; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; margin-top: 10px; display: none; }
+	#summary code { font-size: 12px; word-break: break-all; }
+	#chart { width: 100%; height: 110px; margin-top: 8px; display: none; }
+	.help { color: var(--muted); font-size: 12px; }
+	.radio { display: flex; gap: 12px; margin: 6px 0; }
+	.radio label { margin: 0; justify-content: flex-start; }
+	.wp-popup input { width: 70px; }
+	.wp-popup button { margin-top: 6px; }
+	.wp-icon { background: var(--accent); color: var(--accent-text); border: 2px solid #fff; border-radius: 50%; width: 22px !important; height: 22px !important; margin: -11px 0 0 -11px !important; display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 700; box-shadow: 0 1px 3px rgba(0,0,0,.4); }
+	@media (max-width: 720px) {
+		body { flex-direction: column; }
+		#side { width: 100%; height: auto; max-height: 50%; border-right: none; border-bottom: 1px solid var(--border); }
+		#map { height: 50%; }
+	}
+</style>
+</head>
+<body>
+<div id="side">
+	<h1>Route Planner</h1>
+	<div class="sub">Traiettorie a 10 Hz per <b>gnss-sdr-sim</b> (<code>-x</code> / <code>-u</code>)</div>
+
+	<form id="search">
+		<input id="q" type="search" placeholder="Cerca un luogo…" aria-label="Cerca un luogo">
+		<button type="submit">Cerca</button>
+	</form>
+
+	<h2>Percorso</h2>
+	<div class="help">Clic sulla mappa: aggiungi un punto. Trascina un punto per spostarlo; clic su un punto per la velocità del tratto successivo o per cancellarlo.</div>
+	<label>Tracciato
+		<select id="routing">
+			<option value="straight">Linea retta</option>
+			<option value="car">Strade (auto)</option>
+			<option value="bike">Ciclabile</option>
+			<option value="foot">A piedi</option>
+		</select>
+	</label>
+	<div class="row">
+		<button id="undo" type="button">Annulla ultimo</button>
+		<button id="reverse" type="button">Inverti</button>
+		<button id="clear" type="button">Cancella</button>
+	</div>
+	<div class="row" style="margin-top:6px">
+		<button id="import" type="button">Importa GPX/KML/GeoJSON</button>
+		<input id="file" type="file" accept=".gpx,.kml,.geojson,.json" hidden>
+	</div>
+
+	<h2>Movimento</h2>
+	<label>Velocità di default <span><input id="speed" type="number" min="1" step="1" value="50"> <span class="u">km/h</span></span></label>
+	<label>Accelerazione/frenata <span><input id="accel" type="number" min="0.1" step="0.1" value="1.5"> <span class="u">m/s²</span></span></label>
+	<label>Accel. laterale in curva <span><input id="lat_accel" type="number" min="0.1" step="0.1" value="2"> <span class="u">m/s²</span></span></label>
+	<label>Arrotondamento curve <span><input id="smooth" type="number" min="0" step="5" value="20"> <span class="u">m</span></span></label>
+	<label>Sosta iniziale <span><input id="hold_start" type="number" min="0" step="5" value="60"> <span class="u">s</span></span></label>
+	<label>Sosta finale <span><input id="hold_end" type="number" min="0" step="5" value="10"> <span class="u">s</span></span></label>
+
+	<h2>Quota</h2>
+	<div class="radio">
+		<label><input type="radio" name="hmode" value="dem" checked> Terreno</label>
+		<label><input type="radio" name="hmode" value="const"> Costante</label>
+	</div>
+	<label>Quota costante <span><input id="height" type="number" step="1" value="250" disabled> <span class="u">m s.l.m.</span></span></label>
+	<label>Antenna sopra il suolo <span><input id="agl" type="number" step="0.5" value="0"> <span class="u">m</span></span></label>
+	<div class="help">Terreno: Copernicus DEM (Open-Meteo). Le quote s.l.m. sono convertite in quote ellissoidiche con il geoide EGM96.</div>
+
+	<h2>Uscita</h2>
+	<label>Formato
+		<select id="format">
+			<option value="llh">lat, lon, quota (-x)</option>
+			<option value="ecef">ECEF x, y, z (-u)</option>
+		</select>
+	</label>
+	<div class="row">
+		<button id="generate" class="primary" type="button">Genera CSV</button>
+		<button id="savejson" type="button">Salva GeoJSON</button>
+	</div>
+	<div id="status"></div>
+	<div id="summary"></div>
+	<canvas id="chart"></canvas>
+</div>
+<div id="map"></div>
+
+<script>
+(function () {
+	'use strict';
+
+	var OSRM = {
+		car: 'https://router.project-osrm.org/route/v1/driving/',
+		bike: 'https://routing.openstreetmap.de/routed-bike/route/v1/driving/',
+		foot: 'https://routing.openstreetmap.de/routed-foot/route/v1/driving/'
+	};
+	var MAX_MARKERS = 200; // Longer imported tracks are kept as a fixed path
+
+	var geoid = new RouteCore.Geoid(EGM96_GRID);
+	var $ = function (id) { return document.getElementById(id); };
+
+	var map = L.map('map').setView([45.07, 7.66], 13);
+	L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+		maxZoom: 19,
+		attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
+	}).addTo(map);
+
+	var css = getComputedStyle(document.documentElement);
+	var routeLine = L.polyline([], { color: css.getPropertyValue('--route').trim(), weight: 4, opacity: .8 }).addTo(map);
+	var trajLine = L.polyline([], { color: css.getPropertyValue('--traj').trim(), weight: 2, dashArray: '4 4' }).addTo(map);
+
+	// State: waypoints with the speed of the following leg (km/h, null = default), legs between them
+	var wps = [];          // {lat, lon, speed, marker}
+	var legs = [];         // legs[i]: [[lat, lon, h|null], ...] from wps[i] to wps[i+1]
+	var fixedPath = null;  // imported long track: {points: [[lat, lon, h]], speeds: [...] | null}
+	var routeCache = {};
+	var lastResult = null;
+
+	function setStatus(msg, err) {
+		var el = $('status');
+		el.textContent = msg || '';
+		el.className = err ? 'err' : '';
+	}
+
+	function num(id) {
+		var v = parseFloat($(id).value);
+		return isFinite(v) ? v : RouteCore.DEFAULTS[id];
+	}
+
+	function hmode() {
+		return document.querySelector('input[name=hmode]:checked').value;
+	}
+
+	// ------------------------------------------------------------ waypoints
+
+	function icon(i) {
+		return L.divIcon({ className: 'wp-icon', html: String(i + 1) });
+	}
+
+	function addWaypoint(lat, lon, speed) {
+		var wp = { lat: lat, lon: lon, speed: speed == null ? null : speed };
+		wp.marker = L.marker([lat, lon], { draggable: true, icon: icon(wps.length) }).addTo(map);
+		wp.marker.on('dragend', function (e) {
+			var ll = e.target.getLatLng();
+			wp.lat = ll.lat; wp.lon = ll.lng;
+			updateRoute();
+		});
+		wp.marker.on('click', function () { openPopup(wp); });
+		wps.push(wp);
+	}
+
+	function openPopup(wp) {
+		var i = wps.indexOf(wp);
+		var div = document.createElement('div');
+		div.className = 'wp-popup';
+		var html = '<b>Punto ' + (i + 1) + '</b><br>' + wp.lat.toFixed(6) + ', ' + wp.lon.toFixed(6) + '<br>';
+		if (i < wps.length - 1)
+			html += 'Velocità tratto ' + (i + 1) + '→' + (i + 2) + ': <input type="number" min="1" step="1" placeholder="' +
+				num('speed') + '" value="' + (wp.speed == null ? '' : wp.speed) + '"> km/h<br>';
+		html += '<button type="button">Cancella punto</button>';
+		div.innerHTML = html;
+		var inp = div.querySelector('input');
+		if (inp)
+			inp.addEventListener('change', function () {
+				var v = parseFloat(inp.value);
+				wp.speed = isFinite(v) && v > 0 ? v : null;
+				invalidate();
+			});
+		div.querySelector('button').addEventListener('click', function () {
+			map.closePopup();
+			removeWaypoint(wp);
+		});
+		L.popup().setLatLng([wp.lat, wp.lon]).setContent(div).openOn(map);
+	}
+
+	function removeWaypoint(wp) {
+		map.removeLayer(wp.marker);
+		wps.splice(wps.indexOf(wp), 1);
+		renumber();
+		updateRoute();
+	}
+
+	function renumber() {
+		wps.forEach(function (w, i) { w.marker.setIcon(icon(i)); });
+	}
+
+	function clearAll() {
+		wps.forEach(function (w) { map.removeLayer(w.marker); });
+		wps = []; legs = []; fixedPath = null;
+		routeLine.setLatLngs([]);
+		invalidate();
+	}
+
+	function invalidate() {
+		lastResult = null;
+		trajLine.setLatLngs([]);
+		$('summary').style.display = 'none';
+		$('chart').style.display = 'none';
+	}
+
+	// ------------------------------------------------------------ routing
+
+	function routeLeg(a, b, mode) {
+		if (mode === 'straight')
+			return Promise.resolve([[a.lat, a.lon, null], [b.lat, b.lon, null]]);
+		var key = mode + ':' + a.lat.toFixed(6) + ',' + a.lon.toFixed(6) + ';' + b.lat.toFixed(6) + ',' + b.lon.toFixed(6);
+		if (routeCache[key])
+			return Promise.resolve(routeCache[key]);
+		var url = OSRM[mode] + a.lon + ',' + a.lat + ';' + b.lon + ',' + b.lat + '?overview=full&geometries=geojson';
+		return fetch(url).then(function (r) {
+			if (!r.ok) throw new Error('routing HTTP ' + r.status);
+			return r.json();
+		}).then(function (j) {
+			if (j.code !== 'Ok' || !j.routes.length) throw new Error('nessun percorso trovato');
+			// The route starts and ends where the waypoints snap to the road network (adding the
+			// clicked points would make a back-and-forth spur at every waypoint)
+			var c = j.routes[0].geometry.coordinates.map(function (p) { return [p[1], p[0], null]; });
+			routeCache[key] = c;
+			return c;
+		});
+	}
+
+	var routeSeq = 0;
+	function updateRoute() {
+		invalidate();
+		if (fixedPath) {
+			routeLine.setLatLngs(fixedPath.points.map(function (p) { return [p[0], p[1]]; }));
+			return Promise.resolve();
+		}
+		var mode = $('routing').value, seq = ++routeSeq;
+		if (wps.length < 2) {
+			legs = [];
+			routeLine.setLatLngs([]);
+			return Promise.resolve();
+		}
+		setStatus(mode === 'straight' ? '' : 'Calcolo del percorso…');
+		var jobs = [];
+		for (var i = 0; i < wps.length - 1; i++)
+			jobs.push(routeLeg(wps[i], wps[i + 1], mode));
+		return Promise.all(jobs).then(function (res) {
+			if (seq !== routeSeq) return;
+			legs = res;
+			routeLine.setLatLngs(denseRoute().points.map(function (p) { return [p[0], p[1]]; }));
+			setStatus('');
+		}).catch(function (e) {
+			if (seq !== routeSeq) return;
+			legs = [];
+			routeLine.setLatLngs([]);
+			setStatus('Routing non riuscito (' + e.message + '). Prova "Linea retta".', true);
+		});
+	}
+
+	// Dense route: points and speed of each segment [km/h]
+	function denseRoute() {
+		var def = num('speed');
+		if (fixedPath) {
+			var sp = fixedPath.speeds && fixedPath.speeds.length === fixedPath.points.length - 1 ? fixedPath.speeds :
+				fixedPath.points.slice(1).map(function () { return def; });
+			return { points: fixedPath.points, speeds: sp };
+		}
+		var pts = [], spd = [];
+		legs.forEach(function (leg, i) {
+			var v = wps[i].speed == null ? def : wps[i].speed;
+			leg.forEach(function (p, j) {
+				if (pts.length && j === 0) return; // shared with the previous leg
+				if (pts.length) spd.push(v);
+				pts.push(p);
+			});
+		});
+		return { points: pts, speeds: spd };
+	}
+
+	// ------------------------------------------------------------ terrain
+
+	function fetchDem(latlons) {
+		var chunks = [];
+		for (var i = 0; i < latlons.length; i += 100)
+			chunks.push(latlons.slice(i, i + 100));
+		var out = [];
+		return chunks.reduce(function (p, c, k) {
+			return p.then(function () {
+				setStatus('Quote del terreno… ' + Math.round(100 * k / chunks.length) + '%');
+				var url = 'https://api.open-meteo.com/v1/elevation?latitude=' +
+					c.map(function (q) { return q[0].toFixed(6); }).join(',') + '&longitude=' +
+					c.map(function (q) { return q[1].toFixed(6); }).join(',');
+				return fetch(url).then(function (r) {
+					if (!r.ok) throw new Error('quote HTTP ' + r.status);
+					return r.json();
+				}).then(function (j) { out = out.concat(j.elevation); });
+			});
+		}, Promise.resolve()).then(function () { return out; });
+	}
+
+	// ------------------------------------------------------------ generation
+
+	function options() {
+		return {
+			accel: num('accel'), lat_accel: num('lat_accel'), smooth: num('smooth'),
+			hold_start: num('hold_start'), hold_end: num('hold_end'), agl: num('agl'),
+			height_ref: fixedPath && fixedPath.heightRef === 'ellipsoid' && hmode() !== 'const' ? 'ellipsoid' : 'msl'
+		};
+	}
+
+	function routeForBuild() {
+		var r = denseRoute();
+		var pts = r.points.map(function (p) {
+			if (hmode() === 'const') return [p[0], p[1], num('height')];
+			if (fixedPath && fixedPath.useHeights && p[2] != null) return [p[0], p[1], p[2]];
+			return [p[0], p[1], null];
+		});
+		return { points: pts, speeds: r.speeds.map(function (v) { return v / 3.6; }) };
+	}
+
+	function build() {
+		var r = routeForBuild(), opts = options();
+		if (r.points.length < 2)
+			return Promise.reject(new Error('servono almeno due punti'));
+		try {
+			return Promise.resolve(RouteCore.buildTrajectory(r.points, r.speeds, opts, geoid, null));
+		} catch (e) {
+			if (!e.needDem) return Promise.reject(e);
+			return fetchDem(e.needDem).then(function (h) {
+				return RouteCore.buildTrajectory(r.points, r.speeds, opts, geoid, h);
+			});
+		}
+	}
+
+	function download(name, text, type) {
+		var a = document.createElement('a');
+		a.href = URL.createObjectURL(new Blob([text], { type: type }));
+		a.download = name;
+		document.body.appendChild(a);
+		a.click();
+		setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+	}
+
+	function showResult(res) {
+		var s = res.summary, fmt = $('format').value;
+		var step = Math.max(1, Math.floor(res.rows.length / 4000));
+		trajLine.setLatLngs(res.rows.filter(function (r, i) { return i % step === 0; }).map(function (r) { return [r[1], r[2]]; }));
+		var el = $('summary');
+		el.innerHTML = 'Lunghezza <b>' + (s.length_m / 1000).toFixed(2) + ' km</b> · in movimento <b>' + fmtTime(s.moving_s) +
+			'</b> · totale <b>' + fmtTime(s.total_s) + '</b><br>Velocità media ' + s.mean_speed_kmh.toFixed(1) +
+			' km/h, massima ' + s.max_speed_kmh.toFixed(1) + ' km/h · ' + s.rows + ' righe<br>' +
+			'<code>./gnss-sdr-sim -D -T now ' + (fmt === 'ecef' ? '-u' : '-x') + ' route.csv -a -b 8</code>';
+		el.style.display = 'block';
+		drawChart(res.rows);
+	}
+
+	function fmtTime(sec) {
+		var m = Math.floor(sec / 60), s = Math.round(sec - 60 * m);
+		return m ? m + ' min ' + s + ' s' : s + ' s';
+	}
+
+	// Speed profile from the 10 Hz positions
+	function drawChart(rows) {
+		var cv = $('chart'), dpr = window.devicePixelRatio || 1;
+		cv.style.display = 'block';
+		var w = cv.clientWidth, h = cv.clientHeight;
+		cv.width = w * dpr; cv.height = h * dpr;
+		var g = cv.getContext('2d');
+		g.scale(dpr, dpr);
+		var fr = new RouteCore.LocalFrame(rows[0][1], rows[0][2]);
+		var prev = fr.toEnu(rows[0][1], rows[0][2]), v = [0], vmax = 1;
+		for (var i = 1; i < rows.length; i++) {
+			var e = fr.toEnu(rows[i][1], rows[i][2]);
+			var sp = Math.hypot(e[0] - prev[0], e[1] - prev[1], e[2] - prev[2]) * 10 * 3.6;
+			v.push(sp); vmax = Math.max(vmax, sp); prev = e;
+		}
+		var st = getComputedStyle(document.documentElement);
+		g.strokeStyle = st.getPropertyValue('--border').trim();
+		g.fillStyle = st.getPropertyValue('--muted').trim();
+		g.font = '11px system-ui, sans-serif';
+		g.beginPath(); g.moveTo(30, 6); g.lineTo(30, h - 16); g.lineTo(w - 4, h - 16); g.stroke();
+		g.fillText(Math.round(vmax) + ' km/h', 32, 12);
+		g.fillText(fmtTime(rows[rows.length - 1][0]), w - 60, h - 3);
+		g.fillText('0', 18, h - 16);
+		g.strokeStyle = st.getPropertyValue('--traj').trim();
+		g.lineWidth = 1.5;
+		g.beginPath();
+		var n = v.length, stepc = Math.max(1, Math.floor(n / (w - 34)));
+		for (i = 0; i < n; i += stepc) {
+			var x = 30 + (w - 34) * i / (n - 1), y = (h - 16) - (h - 24) * v[i] / vmax;
+			if (i === 0) g.moveTo(x, y); else g.lineTo(x, y);
+		}
+		g.stroke();
+	}
+
+	$('generate').addEventListener('click', function () {
+		var btn = this;
+		btn.disabled = true;
+		setStatus('Generazione…');
+		build().then(function (res) {
+			lastResult = res;
+			showResult(res);
+			download('route.csv', RouteCore.toCsv(res.rows, $('format').value === 'ecef'), 'text/csv');
+			setStatus('File route.csv scaricato.');
+		}).catch(function (e) {
+			setStatus('Errore: ' + e.message, true);
+		}).then(function () { btn.disabled = false; });
+	});
+
+	// GeoJSON readable by route2motion.py and by this page (waypoints kept in the properties)
+	$('savejson').addEventListener('click', function () {
+		var r = denseRoute();
+		if (r.points.length < 2) { setStatus('Servono almeno due punti.', true); return; }
+		var constH = hmode() === 'const' ? num('height') : null;
+		var gj = {
+			type: 'Feature',
+			properties: {
+				generator: 'gnss-sdr-sim route_planner',
+				speeds_kmh: r.speeds,
+				height_ref: 'msl',
+				routing: fixedPath ? 'imported' : $('routing').value,
+				waypoints: fixedPath ? null : wps.map(function (w) { return { lat: w.lat, lon: w.lon, speed_kmh: w.speed }; }),
+				options: options()
+			},
+			geometry: {
+				type: 'LineString',
+				coordinates: r.points.map(function (p) {
+					var h = constH != null ? constH : (fixedPath && fixedPath.useHeights ? p[2] : null);
+					return h == null ? [+p[1].toFixed(7), +p[0].toFixed(7)] : [+p[1].toFixed(7), +p[0].toFixed(7), +h.toFixed(2)];
+				})
+			}
+		};
+		download('route.geojson', JSON.stringify(gj), 'application/geo+json');
+		setStatus('File route.geojson scaricato.');
+	});
+
+	// ------------------------------------------------------------ import
+
+	function parseRouteFile(name, text) {
+		var ext = name.split('.').pop().toLowerCase(), pts = [], props = {};
+		if (ext === 'gpx' || ext === 'kml') {
+			var doc = new DOMParser().parseFromString(text, 'application/xml');
+			if (ext === 'gpx') {
+				['trkpt', 'rtept', 'wpt'].some(function (tag) {
+					var els = doc.getElementsByTagNameNS('*', tag);
+					for (var i = 0; i < els.length; i++) {
+						var ele = els[i].getElementsByTagNameNS('*', 'ele')[0];
+						pts.push([+els[i].getAttribute('lat'), +els[i].getAttribute('lon'), ele ? +ele.textContent : null]);
+					}
+					return pts.length > 0;
+				});
+			} else {
+				var cs = doc.getElementsByTagNameNS('*', 'coordinates');
+				for (var k = 0; k < cs.length; k++)
+					cs[k].textContent.trim().split(/\s+/).forEach(function (tok) {
+						var v = tok.split(',').map(Number);
+						pts.push([v[1], v[0], v.length > 2 ? v[2] : null]);
+					});
+				var gx = doc.getElementsByTagNameNS('*', 'coord');
+				for (k = 0; k < gx.length; k++) {
+					var c = gx[k].textContent.trim().split(/\s+/).map(Number);
+					pts.push([c[1], c[0], c.length > 2 ? c[2] : null]);
+				}
+			}
+		} else {
+			var gj = JSON.parse(text);
+			var feats = gj.type === 'FeatureCollection' ? gj.features : [gj];
+			feats.forEach(function (f) {
+				var g = f.geometry || f, coords = [];
+				if (g.type === 'LineString') { coords = g.coordinates; props = f.properties || props; }
+				else if (g.type === 'MultiLineString') { coords = [].concat.apply([], g.coordinates); props = f.properties || props; }
+				else if (g.type === 'Point') coords = [g.coordinates];
+				coords.forEach(function (c) { pts.push([c[1], c[0], c.length > 2 ? c[2] : null]); });
+			});
+		}
+		return { points: pts, props: props };
+	}
+
+	$('import').addEventListener('click', function () { $('file').click(); });
+	$('file').addEventListener('change', function () {
+		var f = this.files[0];
+		if (!f) return;
+		var reader = new FileReader();
+		reader.onload = function () {
+			try {
+				var r = parseRouteFile(f.name, reader.result), p = r.props;
+				if (r.points.length < 2) throw new Error('nessun percorso nel file');
+				clearAll();
+				if (p.waypoints && p.waypoints.length >= 2) {
+					// File saved by this page: editable again
+					if (p.routing && OSRM[p.routing] || p.routing === 'straight') $('routing').value = p.routing;
+					p.waypoints.forEach(function (w) { addWaypoint(w.lat, w.lon, w.speed_kmh); });
+				} else if (r.points.length <= MAX_MARKERS && !r.points.some(function (q) { return q[2] != null; })) {
+					$('routing').value = 'straight';
+					r.points.forEach(function (q) { addWaypoint(q[0], q[1], null); });
+				} else {
+					fixedPath = {
+						points: r.points, speeds: p.speeds_kmh || null, heightRef: p.height_ref || 'msl',
+						useHeights: r.points.every(function (q) { return q[2] != null; })
+					};
+				}
+				updateRoute().then(function () {
+					map.fitBounds(routeLine.getBounds(), { padding: [30, 30] });
+					setStatus('Importati ' + r.points.length + ' punti' + (fixedPath ? ' (traccia fissa, quote ' +
+						(fixedPath.useHeights ? 'dal file' : 'dal terreno') + ')' : '') + '.');
+				});
+			} catch (e) {
+				setStatus('Import non riuscito: ' + e.message, true);
+			}
+		};
+		reader.readAsText(f);
+		this.value = '';
+	});
+
+	// ------------------------------------------------------------ search (Nominatim)
+
+	$('search').addEventListener('submit', function (ev) {
+		ev.preventDefault();
+		var q = $('q').value.trim();
+		if (!q) return;
+		fetch('https://nominatim.openstreetmap.org/search?format=json&limit=1&q=' + encodeURIComponent(q))
+			.then(function (r) { return r.json(); })
+			.then(function (j) {
+				if (!j.length) { setStatus('Luogo non trovato.', true); return; }
+				var b = j[0].boundingbox.map(Number);
+				map.fitBounds([[b[0], b[2]], [b[1], b[3]]]);
+				setStatus('');
+			}).catch(function () { setStatus('Ricerca non riuscita.', true); });
+	});
+
+	// ------------------------------------------------------------ controls
+
+	map.on('click', function (e) {
+		if (fixedPath) { setStatus('Traccia importata: premi "Cancella" per disegnare un nuovo percorso.', true); return; }
+		addWaypoint(e.latlng.lat, e.latlng.lng, null);
+		updateRoute();
+	});
+	$('undo').addEventListener('click', function () {
+		if (wps.length) removeWaypoint(wps[wps.length - 1]);
+	});
+	$('reverse').addEventListener('click', function () {
+		if (fixedPath) {
+			fixedPath.points.reverse();
+			if (fixedPath.speeds) fixedPath.speeds.reverse();
+		} else {
+			var speeds = wps.slice(0, -1).map(function (w) { return w.speed; }).reverse();
+			wps.reverse();
+			wps.forEach(function (w, i) { w.speed = i < speeds.length ? speeds[i] : null; });
+			renumber();
+		}
+		updateRoute();
+	});
+	$('clear').addEventListener('click', clearAll);
+	$('routing').addEventListener('change', updateRoute);
+	Array.prototype.forEach.call(document.querySelectorAll('input[name=hmode]'), function (r) {
+		r.addEventListener('change', function () {
+			$('height').disabled = hmode() !== 'const';
+			invalidate();
+		});
+	});
+	['speed', 'accel', 'lat_accel', 'smooth', 'hold_start', 'hold_end', 'height', 'agl', 'format'].forEach(function (id) {
+		$(id).addEventListener('change', invalidate);
+	});
+})();
+</script>
+</body>
+</html>

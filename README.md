@@ -25,21 +25,11 @@ A user guide in Italian, with examples for every SDR front-end, is in [docs/GUID
 $ gcc gpssim.c -lm -O3 -o gnss-sdr-sim
 ```
 
-### Using bigger user motion files
+### User motion file length
 
-In order to use user motion files with more than 30000 samples (at 10Hz), the `USER_MOTION_SIZE`
-variable can be set to the maximum time of the user motion file in seconds. It is advisable to do
-this using make so gps-sdr-bin can update the size when needed. e.g:
-
-```
-$ make USER_MOTION_SIZE=4000
-```
-
-This variable can also be set when compiling directly with GCC:
-
-```
-$ gcc gpssim.c -lm -O3 -o gnss-sdr-sim -DUSER_MOTION_SIZE=4000
-```
+User motion files of any length are read in full: in dynamic mode the simulation lasts as long as
+the motion file, unless `-d` sets a shorter duration. `USER_MOTION_SIZE` (`make USER_MOTION_SIZE=...`)
+now only sets the default duration of the static mode, in tenths of a second.
 
 ### Generating the GPS signal file
 
@@ -69,8 +59,8 @@ The simulation start time can be specified if the corresponding set of ephemerid
 is available. Otherwise the first time of ephemeris in the RINEX navigation file
 is selected.
 
-The maximum simulation duration time is defined by USER_MOTION_SIZE to 
-prevent the output file from getting too large.
+In static mode the default duration is 300 seconds and the maximum 86400 seconds; in dynamic mode
+the default duration is the length of the motion file.
 
 The output file size can be reduced by using "-b 1" option to store 
 four 1-bit I/Q samples into a single byte. 
@@ -93,7 +83,8 @@ Options:
   -L <wnslf,dn,dtslf> User leap future event in GPS week number, day number, next leap second e.g. 2347,3,19
   -t <date,time>   Scenario start time YYYY/MM/DD,hh:mm:ss
   -T <date,time>   Overwrite TOC and TOE to scenario start time
-  -d <duration>    Duration [sec] (dynamic mode max: 300 static mode max: 86400)
+  -d <duration>    Duration [sec] (dynamic mode default: whole motion file,
+                   static mode default: 300, max: 86400)
   -o <output>      I/Q sampling data file (default: gpssim.bin ; use - for stdout)
   -s <frequency>   Sampling frequency [Hz] (default: 2600000, 5000000 with Galileo)
   -b <iq_bits>     I/Q data format [1/8/16] (default: 16)
@@ -187,6 +178,37 @@ The position they compute is then biased by a few meters, mostly in height. `-a`
 Saastamoinen delay with a standard atmosphere (15 °C and 1013.25 hPa at sea level, 70% relative
 humidity, 1/cos(z) mapping), the default model of RTKLIB, to every GPS and Galileo satellite.
 The remaining error depends on how close the receiver model is to this one.
+
+### Drawing a trajectory on a map
+
+The `tools` folder turns a route into a 10 Hz motion file for `-x` (or `-u`):
+
+* `route_planner.html`: draw the route on an OpenStreetMap map (straight lines, or along roads,
+  cycle paths or footpaths with OSRM), set the speed of each leg, and download the CSV. It also
+  imports GPX, KML and GeoJSON files and saves the route as GeoJSON. Serve the folder over HTTP,
+  as browsers do not load the page scripts from `file://`:
+
+  ```
+  > python3 -m http.server 8000 --directory tools
+  ```
+
+  then open http://localhost:8000/route_planner.html.
+* `route2motion.py`: the same conversion from the command line for GPX, KML or GeoJSON files
+  (for instance routes drawn with [gpx.studio](https://gpx.studio) or Google My Maps). Python 3
+  standard library only.
+
+  ```
+  > python3 tools/route2motion.py route.gpx -o route.csv --speed 50
+  > gnss-sdr-sim -D -T now -x route.csv -a -b 8
+  ```
+
+Both tools give the same trajectory: the route is resampled every metre, corners are rounded,
+the speed is limited by the lateral acceleration in curves and by the acceleration and braking
+limits, and the trajectory starts and ends with a stop (60 s and 10 s by default). Heights come
+from the route, from a constant or from a terrain model (Copernicus DEM, Open-Meteo API), and are
+converted from mean sea level to ellipsoidal heights with the EGM96 geoid (`tools/geoid_egm96.js`).
+Routing, place search and terrain heights use public services (OSRM demo servers, Nominatim,
+Open-Meteo) and need an internet connection.
 
 ### Transmitting the samples
 

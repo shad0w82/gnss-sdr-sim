@@ -99,7 +99,9 @@ const int galCs25[GAL_SEC_CODE_LEN] = {
 // Allocated channel per satellite: GPS PRN 1..32 at [0..31], Galileo SVID 1..36 at [32..67]
 int allocatedSat[MAX_SAT+MAX_SAT_GAL];
 
-double xyz[USER_MOTION_SIZE][3];
+// User positions (ECEF) at 10 Hz, grown as the motion file is read
+double (*xyz)[3] = NULL;
+int xyzSize = 0;
 
 // Galileo ephemeris records per satellite, and the set currently in use
 ephem_t galeph[MAX_SAT_GAL][MAX_GAL_EPH];
@@ -1836,8 +1838,39 @@ void computeCodePhase(channel_t *chan, range_t rho1, double dt)
  *  \param[[in] filename File name of the text input file
  *  \returns Number of user data motion records read, -1 on error
  */
-int readUserMotion(double xyz[USER_MOTION_SIZE][3], const char *filename)
+/*! \brief Get a user motion record, growing the buffer when needed
+ *  \param[in] i Record index
+ *  \returns Pointer to the ECEF position of the record
+ */
+double *userMotion(int i)
 {
+	int size;
+	double (*p)[3];
+
+	if (i>=xyzSize)
+	{
+		size = (xyzSize==0) ? USER_MOTION_SIZE : xyzSize;
+		while (i>=size)
+			size *= 2;
+
+		p = (double (*)[3])realloc(xyz, (size_t)size*sizeof(*xyz));
+		if (p==NULL)
+		{
+			fprintf(stderr, "ERROR: Failed to allocate the user motion buffer.\n");
+			exit(1);
+		}
+
+		memset(p+xyzSize, 0, (size_t)(size-xyzSize)*sizeof(*xyz));
+		xyz = p;
+		xyzSize = size;
+	}
+
+	return(xyz[i]);
+}
+
+int readUserMotion(const char *filename)
+{
+	double *p;
 	FILE *fp;
 	int numd;
 	char str[MAX_CHAR];
@@ -1846,7 +1879,7 @@ int readUserMotion(double xyz[USER_MOTION_SIZE][3], const char *filename)
 	if (NULL==(fp=fopen(filename,"rt")))
 		return(-1);
 
-	for (numd=0; numd<USER_MOTION_SIZE; numd++)
+	for (numd=0; ; numd++)
 	{
 		if (fgets(str, MAX_CHAR, fp)==NULL)
 			break;
@@ -1854,9 +1887,10 @@ int readUserMotion(double xyz[USER_MOTION_SIZE][3], const char *filename)
 		if (EOF==sscanf(str, "%lf,%lf,%lf,%lf", &t, &x, &y, &z)) // Read CSV line
 			break;
 
-		xyz[numd][0] = x;
-		xyz[numd][1] = y;
-		xyz[numd][2] = z;
+		p = userMotion(numd);
+		p[0] = x;
+		p[1] = y;
+		p[2] = z;
 	}
 
 	fclose(fp);
@@ -1871,7 +1905,7 @@ int readUserMotion(double xyz[USER_MOTION_SIZE][3], const char *filename)
  *
  * Added by romalvarezllorens@gmail.com
  */
-int readUserMotionLLH(double xyz[USER_MOTION_SIZE][3], const char *filename)
+int readUserMotionLLH(const char *filename)
 {
 	FILE *fp;
 	int numd;
@@ -1881,7 +1915,7 @@ int readUserMotionLLH(double xyz[USER_MOTION_SIZE][3], const char *filename)
 	if (NULL==(fp=fopen(filename,"rt")))
 		return(-1);
 
-	for (numd=0; numd<USER_MOTION_SIZE; numd++)
+	for (numd=0; ; numd++)
 	{
 		if (fgets(str, MAX_CHAR, fp)==NULL)
 			break;
@@ -1899,7 +1933,7 @@ int readUserMotionLLH(double xyz[USER_MOTION_SIZE][3], const char *filename)
 		llh[0] /= R2D; // convert to RAD
 		llh[1] /= R2D; // convert to RAD
 
-		llh2xyz(llh, xyz[numd]);
+		llh2xyz(llh, userMotion(numd));
 	}
 
 	fclose(fp);
@@ -1907,13 +1941,13 @@ int readUserMotionLLH(double xyz[USER_MOTION_SIZE][3], const char *filename)
 	return (numd);
 }
 
-int readNmeaGGA(double xyz[USER_MOTION_SIZE][3], const char *filename)
+int readNmeaGGA(const char *filename)
 {
 	FILE *fp;
 	int numd = 0;
 	char str[MAX_CHAR];
 	char *token;
-	double llh[3],pos[3];
+	double llh[3];
 	char tmp[8];
 
 	if (NULL==(fp=fopen(filename,"rt")))
@@ -1969,17 +2003,10 @@ int readNmeaGGA(double xyz[USER_MOTION_SIZE][3], const char *filename)
 			llh[2] += atof(token);
 
 			// Convert geodetic position into ECEF coordinates
-			llh2xyz(llh, pos);
-
-			xyz[numd][0] = pos[0];
-			xyz[numd][1] = pos[1];
-			xyz[numd][2] = pos[2];
+			llh2xyz(llh, userMotion(numd));
 
 			// Update the number of track points
 			numd++;
-
-			if (numd>=USER_MOTION_SIZE)
-				break;
 		}
 	}
 
@@ -2746,7 +2773,8 @@ void usage(void)
 		"  -L <wnslf,dn,dtslf> User leap future event in GPS week number, day number, next leap second e.g. 2347,3,19\n"
 		"  -t <date,time>   Scenario start time YYYY/MM/DD,hh:mm:ss\n"
 		"  -T <date,time>   Overwrite TOC and TOE to scenario start time\n"
-		"  -d <duration>    Duration [sec] (dynamic mode max: %.0f, static mode max: %d)\n"
+		"  -d <duration>    Duration [sec] (dynamic mode default: whole motion file,\n"
+		"                   static mode default: %.0f, max: %d)\n"
 		"  -o <output>      I/Q sampling data file (default: gpssim.bin)\n"
 		"  -s <frequency>   Sampling frequency [Hz] (default: 2600000, 5000000 with Galileo)\n"
 		"  -b <iq_bits>     I/Q data format [1/8/16] (default: 16)\n"
@@ -2825,6 +2853,7 @@ int main(int argc, char *argv[])
 	double duration;
 	int iduration;
 	int verb;
+	int duration_set = FALSE;
 
 	int timeoverwrite = FALSE; // Overwrite the TOC and TOE in the RINEX file
 	int download = FALSE; // Download the broadcast ephemerides
@@ -2856,6 +2885,8 @@ int main(int argc, char *argv[])
 		usage();
 		exit(1);
 	}
+
+	userMotion(0); // Allocate the first record, used by the static location mode
 
 	while ((result=getopt(argc,argv,"e:DC:u:x:g:c:l:o:s:b:L:T:t:d:iapv"))!=-1)
 	{
@@ -2970,6 +3001,7 @@ int main(int argc, char *argv[])
 			break;
 		case 'd':
 			duration = atof(optarg);
+			duration_set = TRUE;
 			break;
 		case 'i':
 			ionoutc.enable = FALSE; // Disable ionospheric correction
@@ -3063,7 +3095,7 @@ int main(int argc, char *argv[])
 		llh[2] = 10.0;
 	}
 
-	if (duration<0.0 || (duration>((double)USER_MOTION_SIZE)/10.0 && !staticLocationMode) || (duration>STATIC_MAX_DURATION && staticLocationMode))
+	if (duration<0.0 || (duration>STATIC_MAX_DURATION && staticLocationMode))
 	{
 		fprintf(stderr, "ERROR: Invalid duration.\n");
 		exit(1);
@@ -3078,11 +3110,11 @@ int main(int argc, char *argv[])
 	{
 		// Read user motion file
 		if (nmeaGGA==TRUE)
-			numd = readNmeaGGA(xyz, umfile);
+			numd = readNmeaGGA(umfile);
 		else if (umLLH == TRUE)
-			numd = readUserMotionLLH(xyz, umfile);
+			numd = readUserMotionLLH(umfile);
 		else
-			numd = readUserMotion(xyz, umfile);
+			numd = readUserMotion(umfile);
 
 		if (numd==-1)
 		{
@@ -3095,8 +3127,8 @@ int main(int argc, char *argv[])
 			exit(1);
 		}
 
-		// Set simulation duration
-		if (numd>iduration)
+		// Set simulation duration (whole motion file by default)
+		if (duration_set==TRUE && numd>iduration)
 			numd = iduration;
 
 		// Set user initial position
