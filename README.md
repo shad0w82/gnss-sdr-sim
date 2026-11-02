@@ -75,7 +75,9 @@ for bladeRF to playback the compressed file.
 ```
 Usage: gps-sdr-sim [options]
 Options:
-  -e <gps_nav>     RINEX navigation file: RINEX 2 GPS, or RINEX 3 GPS/Galileo/mixed (required)
+  -e <gps_nav>     RINEX navigation file: RINEX 2 GPS, or RINEX 3 GPS/Galileo/mixed
+  -D               Download the daily GPS/Galileo broadcast ephemerides of the scenario
+                   date from BKG instead of -e (needs curl and gzip)
   -C <systems>     Constellations to simulate: G (GPS), E (Galileo), e.g. GE
                    (default: every constellation found in the navigation file)
   -u <user_motion> User motion file in ECEF x, y, z format (dynamic mode)
@@ -129,6 +131,26 @@ when both are present; `-C` selects the constellations:
 ```
 
 RINEX 2 GPS files keep working as before, and GPS output is unchanged.
+
+#### Downloading the ephemerides automatically
+
+With `-D` instead of `-e`, the daily mixed broadcast file is downloaded from the public
+[BKG archive](https://igs.bkg.bund.de/root_ftp/IGS/BRDC/) (no registration) into the current
+directory, using the `curl` and `gzip` commands (on Windows, `curl` is built in and `gzip` comes
+for instance with Git for Windows):
+
+```
+> gps-sdr-sim -D -l 45.07,7.66,250 -t 2026/10/30,10:00:00   # file of 2026/10/30
+> gps-sdr-sim -D -l 45.07,7.66,250 -T now                   # recent file, shifted to now
+> gps-sdr-sim -D -l 45.07,7.66,250                          # file of today
+```
+
+* The date is the one of `-t` or `-T`, or today. With `-T` or without a date, the file of the
+  previous day is tried too when the one of the scenario date is not available yet.
+* The final file (`BRDC00IGS_R_...`) is used when published, and reused on later runs. For the
+  current day, the file merged in real time (`BRDC00WRD_S_...`) is downloaded on every run, as it
+  grows during the day. It only holds ephemerides up to the last hour or so: start a scenario
+  "now" with `-T now`, which accepts the most recent ephemerides.
 
 The simulated Galileo signal is:
 

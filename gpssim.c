@@ -2644,11 +2644,98 @@ int allocateChannel(channel_t *chan, ephem_t *eph, ionoutc_t ionoutc, gpstime_t 
 	return(nsat);
 }
 
+/*! \brief Download the daily broadcast ephemeris file (RINEX 3, mixed) from BKG
+ *  \param[in] g Scenario date
+ *  \param[in] nday Number of days to try, going back from the scenario date
+ *  \param[out] navfile Name of the downloaded file
+ *  \returns 0 on success, -1 on failure
+ *
+ *  For each day the final merged IGS file is tried first, then the files
+ *  merged in real time during the day. Final files already in the current
+ *  directory are reused; real-time files are downloaded again because they
+ *  grow during the day. Requires the curl and gzip commands.
+ */
+int downloadRinexNav(gpstime_t g, int nday, char *navfile)
+{
+	static const char *prefix[3] = {"BRDC00IGS_R", "BRDC00WRD_S", "BRDC00WRD_R"};
+	static const int cumday[12] = {0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334};
+	char fname[MAX_PATH_LEN],gzname[MAX_PATH_LEN],url[MAX_PATH_LEN],cmd[3*MAX_PATH_LEN];
+	datetime_t t;
+	gpstime_t gd;
+	FILE *fp;
+	int iday,k,doy,ok;
+
+	for (iday=0; iday<nday; iday++)
+	{
+		gd = incGpsTime(g, -SECONDS_IN_DAY*iday);
+		gps2date(&gd, &t);
+
+		doy = cumday[t.m-1] + t.d;
+		if (t.m>2 && ((t.y%4==0 && t.y%100!=0) || t.y%400==0))
+			doy++;
+
+		for (k=0; k<3; k++)
+		{
+			snprintf(fname, MAX_PATH_LEN, "%s_%04d%03d0000_01D_MN.rnx", prefix[k], t.y, doy);
+
+			// Reuse a final file downloaded before
+			if (k==0 && (fp=fopen(fname, "rt"))!=NULL)
+			{
+				fclose(fp);
+				if (rinexVersion(fname)>=3.0)
+				{
+					fprintf(stderr, "Using cached ephemeris file %s\n", fname);
+					strcpy(navfile, fname);
+					return(0);
+				}
+			}
+
+			snprintf(url, MAX_PATH_LEN, "https://igs.bkg.bund.de/root_ftp/IGS/BRDC/%04d/%03d/%s.gz", t.y, doy, fname);
+			fprintf(stderr, "Downloading %s\n", url);
+
+			snprintf(gzname, MAX_PATH_LEN, "%s.gz", fname);
+
+			snprintf(cmd, sizeof(cmd), "curl -sfL --connect-timeout 20 -m 300 -o \"%s\" \"%s\"", gzname, url);
+			if (system(cmd)!=0)
+			{
+				fprintf(stderr, "  not available\n");
+				remove(gzname);
+				continue;
+			}
+
+			snprintf(cmd, sizeof(cmd), "gzip -dc \"%s\" > \"%s\"", gzname, fname);
+			ok = (system(cmd)==0);
+			remove(gzname);
+
+			if (!ok)
+			{
+				fprintf(stderr, "ERROR: Failed to decompress %s.gz (is gzip installed?)\n", fname);
+				remove(fname);
+				return(-1);
+			}
+
+			if (rinexVersion(fname)<3.0)
+			{
+				fprintf(stderr, "WARNING: %s is not a RINEX 3 file.\n", fname);
+				remove(fname);
+				continue;
+			}
+
+			strcpy(navfile, fname);
+			return(0);
+		}
+	}
+
+	return(-1);
+}
+
 void usage(void)
 {
 	fprintf(stderr, "Usage: gps-sdr-sim [options]\n"
 		"Options:\n"
-		"  -e <gps_nav>     RINEX navigation file: RINEX 2 GPS, or RINEX 3 GPS/Galileo/mixed (required)\n"
+		"  -e <gps_nav>     RINEX navigation file: RINEX 2 GPS, or RINEX 3 GPS/Galileo/mixed\n"
+		"  -D               Download the daily GPS/Galileo broadcast ephemerides of the scenario\n"
+		"                   date from BKG instead of -e (needs curl and gzip)\n"
 		"  -C <systems>     Constellations to simulate: G (GPS), E (Galileo), e.g. GE\n"
 		"                   (default: every constellation found in the navigation file)\n"
 		"  -u <user_motion> User motion file in ECEF x, y, z format (dynamic mode)\n"
@@ -2740,6 +2827,7 @@ int main(int argc, char *argv[])
 	int verb;
 
 	int timeoverwrite = FALSE; // Overwrite the TOC and TOE in the RINEX file
+	int download = FALSE; // Download the broadcast ephemerides
 
 	ionoutc_t ionoutc;
 	int path_loss_enable = TRUE;
@@ -2769,7 +2857,7 @@ int main(int argc, char *argv[])
 		exit(1);
 	}
 
-	while ((result=getopt(argc,argv,"e:C:u:x:g:c:l:o:s:b:L:T:t:d:iapv"))!=-1)
+	while ((result=getopt(argc,argv,"e:DC:u:x:g:c:l:o:s:b:L:T:t:d:iapv"))!=-1)
 	{
 		switch (result)
 		{
@@ -2905,6 +2993,9 @@ int main(int argc, char *argv[])
 		case 'v':
 			verb = TRUE;
 			break;
+		case 'D':
+			download = TRUE;
+			break;
 		case ':':
 		case '?':
 			usage();
@@ -2914,9 +3005,52 @@ int main(int argc, char *argv[])
 		}
 	}
 
+	if (download==TRUE)
+	{
+		gpstime_t gdl;
+		int nday;
+
+		if (navfile[0]!=0)
+		{
+			fprintf(stderr, "ERROR: Use either -e or -D.\n");
+			exit(1);
+		}
+
+		if (g0.week>=0)
+		{
+			// Scenario date. With -T any recent day will do, as TOC and TOE are overwritten.
+			gdl = g0;
+			nday = (timeoverwrite==TRUE) ? 2 : 1;
+		}
+		else
+		{
+			// Today, or yesterday early in the day
+			time_t timer;
+			struct tm *gmt;
+			datetime_t tnow;
+
+			time(&timer);
+			gmt = gmtime(&timer);
+			tnow.y = gmt->tm_year+1900;
+			tnow.m = gmt->tm_mon+1;
+			tnow.d = gmt->tm_mday;
+			tnow.hh = gmt->tm_hour;
+			tnow.mm = gmt->tm_min;
+			tnow.sec = (double)gmt->tm_sec;
+			date2gps(&tnow, &gdl);
+			nday = 2;
+		}
+
+		if (downloadRinexNav(gdl, nday, navfile)!=0)
+		{
+			fprintf(stderr, "ERROR: Failed to download the broadcast ephemerides.\n");
+			exit(1);
+		}
+	}
+
 	if (navfile[0]==0)
 	{
-		fprintf(stderr, "ERROR: GPS ephemeris file is not specified.\n");
+		fprintf(stderr, "ERROR: Navigation file is not specified (use -e or -D).\n");
 		exit(1);
 	}
 
