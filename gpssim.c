@@ -2871,7 +2871,7 @@ void usage(void)
 		"  -T <date,time>   Overwrite TOC and TOE to scenario start time\n"
 		"  -d <duration>    Duration [sec] (dynamic mode default: whole motion file,\n"
 		"                   static mode default: %.0f, max: %d)\n"
-		"  -o <output>      I/Q sampling data file (default: gpssim.bin)\n"
+		"  -o <output>      I/Q sampling data file (default: gpssim.bin; .C8 with -b 8 also writes a PortaPack .TXT)\n"
 		"  -s <frequency>   Sampling frequency [Hz] (default: 2600000, 5000000 with Galileo,\n"
 		"                   15000000 or more for the full Galileo CBOC)\n"
 		"  -b <iq_bits>     I/Q data format [1/8/16] (default: 16)\n"
@@ -3586,6 +3586,25 @@ int main(int argc, char *argv[])
 			fprintf(stderr, "ERROR: Failed to open output file.\n");
 			exit(1);
 		}
+
+		// PortaPack Mayhem GPS Sim reads the sample rate from a .TXT file next to the .C8 file,
+		// and falls back to 2.6 MHz without it.
+		size_t len = strlen(outfile);
+		if (data_format==SC08 && len>3 && len<MAX_PATH_LEN && outfile[len-3]=='.' &&
+			(outfile[len-2]=='c' || outfile[len-2]=='C') && outfile[len-1]=='8')
+		{
+			char txtfile[MAX_PATH_LEN];
+			FILE *ft;
+
+			strcpy(txtfile, outfile);
+			strcpy(txtfile+len-3, ".TXT");
+			if (NULL!=(ft=fopen(txtfile,"w")))
+			{
+				fprintf(ft, "center_frequency=1575420000\nsample_rate=%.0f\n", samp_freq);
+				fclose(ft);
+				fprintf(stderr, "PortaPack metadata written to %s.\n", txtfile);
+			}
+		}
 	}else{
 		fp = stdout;
 	}
@@ -3823,7 +3842,8 @@ int main(int argc, char *argv[])
 		{
 			for (isamp=0; isamp<2*iq_buff_size; isamp++)
 			{
-				iq8_buff[isamp] = iq_buff[isamp]>>4; // 12-bit bladeRF -> 8-bit HackRF
+				int v = iq_buff[isamp]>>4; // 12-bit bladeRF -> 8-bit HackRF
+				iq8_buff[isamp] = (v>127)?127:((v<-128)?-128:v); // saturate instead of wrapping
 				//iq8_buff[isamp] = iq_buff[isamp] >> 8; // for PocketSDR
 			}
 

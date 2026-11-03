@@ -343,6 +343,31 @@ hackrf_transfer -t gpssim.bin -f 1575420000 -s 5000000 -a 1 -x 0
 alcuni falliscono. Per risultati affidabili usa un TCXO o un riferimento esterno a 10 MHz
 (cartella `extclk/`).
 
+### PortaPack (firmware Mayhem, app GPS Sim)
+
+L'app GPS Sim riproduce file `.C8` (8 bit) dalla cartella `GPS/` della scheda SD. Legge frequenza
+e campionamento da un file `.TXT` con lo stesso nome; **se il `.TXT` manca usa 2,6 MHz**, e un
+file generato a un'altra frequenza viene riprodotto alla velocità sbagliata: i satelliti non
+vengono agganciati. Le frequenze di campionamento documentate come funzionanti sono 2,6, 2,5 e
+1,25 MHz.
+
+Genera il file a 2,6 MHz con estensione `.C8`: il simulatore scrive da solo il `.TXT`
+(`center_frequency=1575420000`, `sample_rate=2600000`) accanto al file.
+
+```bash
+./gnss-sdr-sim -D -T now -l 45.07,7.66,250 -d 300 -a -b 8 -s 2600000 -o gnss.C8
+```
+
+Copia **entrambi** i file (`gnss.C8` e `gnss.TXT`) nella cartella `GPS/` della SD, apri GPS Sim e
+scegli `gnss.C8`.
+
+- A 2,6 MHz il Galileo è a banda ridotta (il simulatore avvisa che è sotto 4 MHz): in una prova di
+  34 s il ricevitore ha agganciato 8 Galileo su 11 (fix di qualche centimetro), contro 11 su 11
+  a 5 MHz. Il GPS non è toccato.
+- Il loop è attivo di default: alla ripetizione il tempo dei satelliti ricomincia da capo e il
+  ricevitore perde il fix. Genera un file lungo quanto la prova (300 s sono 1,5 GB).
+- Il PortaPack ha lo stesso oscillatore dell'HackRF: valgono le note sul clock qui sopra.
+
 ### bladeRF
 
 File a 16 bit (default):
@@ -505,7 +530,7 @@ Il primo fix arriva quando il ricevitore ha decodificato effemeridi e tempo, di 
 | `-t <data,ora>` | Ora di inizio `AAAA/MM/GG,hh:mm:ss`, dentro l'intervallo del file |
 | `-T <data,ora>` | Sposta le effemeridi all'ora indicata; `-T now` usa l'ora attuale |
 | `-d <s>` | Durata in secondi (statica: 300 di default, massimo 86400; dinamica: tutto il file della traiettoria) |
-| `-o <file>` | File di uscita (default `gpssim.bin`; `-` per stdout) |
+| `-o <file>` | File di uscita (default `gpssim.bin`; `-` per stdout; con `-b 8` ed estensione `.C8` scrive anche il `.TXT` per PortaPack) |
 | `-s <Hz>` | Frequenza di campionamento (default 2600000, 5000000 con Galileo; 15000000 per la CBOC completa) |
 | `-b <bit>` | Formato I/Q: 1, 8 o 16 bit (default 16) |
 | `-a` | Aggiunge il ritardo troposferico (modello Saastamoinen) |

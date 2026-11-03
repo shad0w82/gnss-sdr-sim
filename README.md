@@ -295,6 +295,23 @@ You can use `hackrf_transfer` tool in the HackRF host software.
 > hackrf_transfer -t gpssim.bin -f 1575420000 -s 2600000 -a 1 -x 0
 ```
 
+The file and `hackrf_transfer` must use the same sampling frequency: 5 MHz (`-s 5000000`) is the
+default when Galileo is simulated.
+
+#### PortaPack (Mayhem firmware, GPS Sim app):
+
+GPS Sim replays `.C8` files from the `GPS/` folder of the SD card, at the sampling frequency of a
+`.TXT` file with the same name, or at 2.6 MHz when that file is missing. When the output file name
+ends in `.C8` (with `-b 8`), the simulator writes the `.TXT` file next to it. Use 2.6 MHz, a rate
+known to work with the app, and copy both files:
+
+```
+> gnss-sdr-sim -D -T now -l 45.07,7.66,250 -d 300 -b 8 -s 2600000 -o gnss.C8
+```
+
+At 2.6 MHz the Galileo BOC(1,1) spectrum is truncated: in a 34 s test the receiver tracked 8 of
+11 Galileo satellites (11 of 11 at 5 MHz), with centimetre-level fixes.
+
 #### UHD supported devices (tested with USRP2 only):
 
 ```
